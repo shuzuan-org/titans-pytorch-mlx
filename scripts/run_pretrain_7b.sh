@@ -18,10 +18,11 @@ export HF_DATASETS_OFFLINE=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+ACCELERATE=~/miniconda3/envs/sglang/bin/accelerate
 
 cd "$PROJECT_DIR"
 
-accelerate launch \
+"$ACCELERATE" launch \
   --config_file configs/fsdp_7b.yaml \
   scripts/pretrain_distributed.py \
   --model mag \
@@ -45,6 +46,4 @@ accelerate launch \
   --save-every 1000 \
   --eval-every 500 \
   --log-every 10 \
-  --wandb \
-  --wandb-project titans-7b-300B \
   "$@"

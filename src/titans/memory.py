@@ -423,32 +423,31 @@ class NeuralLongTermMemory(nn.Module):
         # y_t = M*(q_t) - forward pass without weight update
         retrieved = self.memory(q)
 
-        # Compute data-dependent gates (averaged over sequence)
-        x_mean = x.mean(dim=1, keepdim=True)  # (batch, 1, dim)
-        alpha = self.gate_decay(x_mean).mean()  # scalar decay
-        theta = self.gate_lr(x_mean).mean() * self.config.memory_lr  # scalar lr
-        eta = (
-            self.gate_momentum(x_mean).mean() * self.config.memory_momentum
-        )  # scalar momentum
+        # Compute data-dependent gates per token (batch, seq, dim)
+        alpha = self.gate_decay(x)   # (batch, seq, dim) — per-token decay
+        theta = self.gate_lr(x) * self.config.memory_lr        # per-token lr
+        eta = self.gate_momentum(x) * self.config.memory_momentum  # per-token momentum
+
+        # Aggregate to scalars for weight update (mean over batch+seq+dim)
+        alpha_s = alpha.mean()
+        theta_s = theta.mean()
+        eta_s = eta.mean()
 
         # Update memory with new key-value pairs
-        # Compute gradients of associative memory loss
         grads = self._compute_gradients(k, v)
 
-        # Use optimized batched memory update when available
-        # Note: Triton path disabled - .item() calls cause CPU-GPU sync slowdown
         if HAS_CUDA_OPTIMIZATIONS and k.is_cuda:
             try:
                 new_weights, new_momentum = batched_memory_update(
-                    state.weights, state.momentum, grads, alpha, eta, theta
+                    state.weights, state.momentum, grads, alpha_s, eta_s, theta_s
                 )
             except Exception:
                 new_weights, new_momentum = self._standard_memory_update(
-                    state.weights, state.momentum, grads, alpha, eta, theta
+                    state.weights, state.momentum, grads, alpha_s, eta_s, theta_s
                 )
         else:
             new_weights, new_momentum = self._standard_memory_update(
-                state.weights, state.momentum, grads, alpha, eta, theta
+                state.weights, state.momentum, grads, alpha_s, eta_s, theta_s
             )
 
         # Output projection

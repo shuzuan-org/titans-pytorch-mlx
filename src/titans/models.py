@@ -17,6 +17,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from titans.attention import SegmentedAttention, SlidingWindowAttention
 from titans.config import TitansConfig
@@ -302,15 +303,13 @@ class TitansMAC(nn.Module):
             chunk_end = min(chunk_start + chunk_size, seq_len)
             chunk = x[:, chunk_start:chunk_end]
 
-            # Process through blocks
-            chunk_states = states
+            # Process through blocks — allocate fresh list each chunk
+            new_states = [None] * len(self.blocks)
             for i, block in enumerate(self.blocks):
-                chunk, new_state = block(chunk, state=chunk_states[i])
+                chunk, new_state = block(chunk, state=states[i])
                 new_states[i] = new_state
 
             outputs.append(chunk)
-
-            # Update states for next chunk
             states = new_states
 
         # Concatenate outputs
@@ -375,6 +374,11 @@ class MAGBlock(nn.Module):
         2. M_t = M_{t-1}(x_t) - Update memory with input (Eq. 27)
         3. o_t = y_t ⊗ M*_t(x_t) - Output is element-wise product (Eq. 28)
 
+        Attention and FFN use gradient checkpointing (stateless, safe).
+        NeuralLongTermMemory is NOT checkpointed: it mutates its own
+        weight tensors via set_weights() during the forward pass, which
+        is incompatible with checkpoint's recompute assumption.
+
         Args:
             x: Input tensor (batch, seq, dim)
             state: Memory state
@@ -387,21 +391,29 @@ class MAGBlock(nn.Module):
         # Get persistent memory as prefix for attention
         persistent = self.persistent(batch_size)
 
-        # Eq. 26: y_t = Attn(x) - Attention branch
+        # Eq. 26: y_t = Attn(x) - Attention branch (checkpointed)
         normed = self.norm1(x)
-        attn_out = self.attention(normed, prefix=persistent)
+
+        def _attn_fn(x_in: torch.Tensor, prefix_in: torch.Tensor) -> torch.Tensor:
+            return self.attention(x_in, prefix=prefix_in)
+
+        attn_out = torch.utils.checkpoint.checkpoint(
+            _attn_fn, normed, persistent, use_reentrant=False
+        )
         y_t = x + self.dropout(attn_out)
 
-        # Eq. 27: M_t = M_{t-1}(x_t) - Memory update with input
+        # Eq. 27: M_t = M_{t-1}(x_t) - Memory update (NOT checkpointed: stateful)
         mem_out, new_state = self.memory(normed, state=state)
 
         # Eq. 28: o_t = y_t ⊗ M*_t(x_t) - Element-wise product
         # Use memory output (which is M*(x)) as the gate
         output = y_t * mem_out
 
-        # Feed-forward
-        normed = self.norm2(output)
-        ffn_out = self.ffn(normed)
+        # Feed-forward (checkpointed)
+        normed2 = self.norm2(output)
+        ffn_out = torch.utils.checkpoint.checkpoint(
+            self.ffn, normed2, use_reentrant=False
+        )
         output = output + self.dropout(ffn_out)
 
         return output, new_state

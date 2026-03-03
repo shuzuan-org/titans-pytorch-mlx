@@ -6,7 +6,7 @@ fsdp_config:
   fsdp_sharding_strategy: FULL_SHARD
   fsdp_offload_params: false
   fsdp_backward_prefetch_policy: BACKWARD_PRE
-  fsdp_activation_checkpointing: true
+  fsdp_activation_checkpointing: false
   fsdp_cpu_ram_efficient_loading: true
   fsdp_use_orig_params: true
   fsdp_sync_module_states: true

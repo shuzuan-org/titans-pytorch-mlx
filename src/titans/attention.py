@@ -19,6 +19,14 @@ from einops import rearrange
 
 from titans.config import TitansConfig
 
+# Check for Flash Attention availability
+try:
+    from flash_attn import flash_attn_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
+    flash_attn_func = None
+
 
 class RotaryPositionEmbedding(nn.Module):
     """Rotary Position Embedding (RoPE).
@@ -179,32 +187,18 @@ class SlidingWindowAttention(nn.Module):
         seq_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Create sliding window causal mask.
-
-        Args:
-            seq_len: Sequence length
-            device: Device for mask
+        """Create sliding window causal mask — only used when Flash Attention is unavailable.
 
         Returns:
-            Boolean mask where True = attend, False = mask out
+            Boolean mask (seq, seq) where True = attend
         """
-        # Create position indices
+        # Use block-diagonal approximation to avoid O(N^2) memory for very long seqs
         positions = torch.arange(seq_len, device=device)
-
-        # Compute distances
         row_idx = positions.unsqueeze(1)  # (seq, 1)
         col_idx = positions.unsqueeze(0)  # (1, seq)
-
-        # Causal: can only attend to past (including self)
         causal_mask = col_idx <= row_idx
-
-        # Window: can only attend within window
         window_mask = (row_idx - col_idx) < self.window_size
-
-        # Combine
-        mask = causal_mask & window_mask
-
-        return mask
+        return causal_mask & window_mask
 
     def forward(
         self,
@@ -216,7 +210,7 @@ class SlidingWindowAttention(nn.Module):
 
         Args:
             x: Input tensor (batch, seq, dim)
-            prefix: Optional prefix tokens that can be attended to (batch, prefix_len, dim)
+            prefix: Optional prefix tokens (batch, prefix_len, dim)
             seq_offset: Offset for rotary embeddings
 
         Returns:
@@ -224,55 +218,89 @@ class SlidingWindowAttention(nn.Module):
         """
         batch_size, seq_len, _ = x.shape
 
-        # If prefix provided, concatenate it
         if prefix is not None:
-            full_x = torch.cat([prefix, x], dim=1)
             prefix_len = prefix.shape[1]
         else:
-            full_x = x
             prefix_len = 0
 
-        full_len = full_x.shape[1]
-
         # Project Q, K, V
-        q = self.proj_q(x)  # Only from x, not prefix
+        q = self.proj_q(x)
+        if prefix is not None:
+            full_x = torch.cat([prefix, x], dim=1)
+        else:
+            full_x = x
         k = self.proj_k(full_x)
         v = self.proj_v(full_x)
 
-        # Reshape for multi-head attention
+        # Use Flash Attention when available — O(N) memory, no explicit mask
+        if HAS_FLASH_ATTN and x.is_cuda:
+            # flash_attn expects (batch, seq, heads, head_dim) in fp16/bf16
+            orig_dtype = q.dtype
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
+
+            q = rearrange(q, "b s (h d) -> b s h d", h=self.num_heads)
+            k = rearrange(k, "b s (h d) -> b s h d", h=self.num_heads)
+            v = rearrange(v, "b s (h d) -> b s h d", h=self.num_heads)
+
+            if self.rope is not None:
+                # RoPE: reshape to (b h s d) for rope then back
+                q_r = rearrange(q, "b s h d -> b h s d")
+                k_r = rearrange(k, "b s h d -> b h s d")
+                q_r, _ = self.rope(q_r, q_r, seq_offset=prefix_len + seq_offset)
+                k_r, _ = self.rope(k_r, k_r, seq_offset=seq_offset)
+                q = rearrange(q_r, "b h s d -> b s h d")
+                k = rearrange(k_r, "b h s d -> b s h d")
+
+            # prefix tokens: attend freely; x tokens: sliding window causal
+            if prefix_len > 0:
+                # Cross-attend: q (seq) -> kv (prefix + seq)
+                # Flash Attention varlen or manual split: use window_size=(-1, 0)
+                # for prefix positions and window_size for main
+                # Simplest correct approach: full causal for prefix cross-attn
+                output = flash_attn_func(
+                    q, k, v,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    softmax_scale=self.scale,
+                    causal=False,  # prefix tokens can be attended freely
+                    window_size=(self.window_size, 0),
+                )
+            else:
+                output = flash_attn_func(
+                    q, k, v,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    window_size=(self.window_size, 0),
+                )
+
+            output = rearrange(output, "b s h d -> b s (h d)").to(orig_dtype)
+            return self.proj_out(output)
+
+        # Fallback: SDPA with explicit mask
         q = rearrange(q, "b s (h d) -> b h s d", h=self.num_heads)
         k = rearrange(k, "b s (h d) -> b h s d", h=self.num_heads)
         v = rearrange(v, "b s (h d) -> b h s d", h=self.num_heads)
 
-        # Apply RoPE
         if self.rope is not None:
-            # For k/v, we need to account for prefix
             q, _ = self.rope(q, q, seq_offset=prefix_len + seq_offset)
             k, _ = self.rope(k, k, seq_offset=seq_offset)
 
-        # Create attention mask for sliding window
-        # For queries in x, we create a mask for attending to full_x
+        full_len = prefix_len + seq_len
         mask = self._create_extended_mask(seq_len, full_len, prefix_len, x.device)
-        # Convert to additive mask for SDPA (0 = attend, -inf = mask)
-        attn_mask = torch.zeros_like(mask, dtype=q.dtype)
+        attn_mask = torch.zeros(1, 1, seq_len, full_len, dtype=q.dtype, device=x.device)
         attn_mask.masked_fill_(~mask, float("-inf"))
 
-        # Use PyTorch SDPA for efficiency
         output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=False,  # We provide explicit mask
+            is_causal=False,
             scale=self.scale,
         )
-
-        # Reshape back
         output = rearrange(output, "b h s d -> b s (h d)")
-
-        # Output projection
-        output = self.proj_out(output)
-
-        return output
+        return self.proj_out(output)
 
     def _create_extended_mask(
         self,

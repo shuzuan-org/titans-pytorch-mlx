@@ -1,0 +1,19 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_transformer_layer_cls_to_wrap: MAGBlock
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_offload_params: false
+  fsdp_backward_prefetch_policy: BACKWARD_PRE
+  fsdp_activation_checkpointing: true
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_use_orig_params: true
+  fsdp_sync_module_states: true
+mixed_precision: bf16
+num_processes: 8
+machine_rank: 0
+num_machines: 1
+rdzv_backend: static
+same_network: true
+main_training_function: main

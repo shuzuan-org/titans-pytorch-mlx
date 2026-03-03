@@ -61,7 +61,11 @@ torch._dynamo.config.suppress_errors = True
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", ".cache/torch_compile")
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
+import yaml
+
 from titans import TitansConfig, TitansLMM, TitansMAC, TitansMAG, TitansMAL
+from titans.data import BinaryTokenDataset, WeightedMixDataset
+from titans.scheduler import get_wsd_schedule
 
 # Optional imports
 try:
@@ -126,6 +130,7 @@ class DistributedTrainingConfig:
     dataset_subset: str | None = None
     local_dataset: str | None = None  # Pre-tokenized local dataset
     data_path: str | None = None
+    bin_data: str | None = None  # Path to mix_weights YAML for binary token datasets
     tokenizer: str = "gpt2"
     seq_len: int = 4096
 
@@ -134,17 +139,22 @@ class DistributedTrainingConfig:
     max_steps: int = -1
     batch_size: int = 4
     gradient_accumulation_steps: int = 32
-    lr: float = 4e-4
+    max_lr: float = 3e-4   # peak LR for both cosine and WSD schedules
+    min_lr: float = 3e-5   # final LR after decay (WSD) or cosine floor
     weight_decay: float = 0.1
     grad_clip: float = 1.0
-    warmup_ratio: float = 0.03
+    warmup_ratio: float = 0.03  # cosine schedule only; WSD uses warmup_steps instead
+
+    # LR Schedule
+    schedule: str = "cosine"  # "cosine" or "wsd"
+    warmup_steps: int = 2000
+    stable_steps: int = 65500
+    decay_steps: int = 7500
 
     # Mixed precision (handled by Accelerate)
     mixed_precision: str = "bf16"
 
-    # Distributed
-    use_fsdp: bool = False
-    fsdp_sharding_strategy: str = "FULL_SHARD"  # FULL_SHARD, SHARD_GRAD_OP, NO_SHARD
+    # Distributed (FSDP strategy is configured via accelerate config YAML)
     gradient_checkpointing: bool = False
 
     # Checkpointing
@@ -370,7 +380,7 @@ class DistributedTrainer:
 
         # Optimizer (use fused=True for faster GPU execution)
         optimizer_kwargs = {
-            "lr": config.lr,
+            "lr": config.max_lr,
             "weight_decay": config.weight_decay,
             "betas": (0.9, 0.95),
         }
@@ -386,14 +396,40 @@ class DistributedTrainer:
         # Calculate total steps
         if config.max_steps > 0:
             self.total_steps = config.max_steps
+        elif config.schedule == "wsd":
+            # WSD total steps are fully defined by the three phase lengths
+            self.total_steps = config.warmup_steps + config.stable_steps + config.decay_steps
         else:
+            # Cosine schedule: derive from dataset size (requires finite dataloader)
             num_batches = len(train_dataloader)
-            num_update_steps = num_batches // config.gradient_accumulation_steps
-            self.total_steps = num_update_steps * config.epochs
+            self.total_steps = (num_batches // config.gradient_accumulation_steps) * config.epochs
 
         # Scheduler
-        num_warmup_steps = int(self.total_steps * config.warmup_ratio)
-        self.scheduler = self._get_cosine_schedule(num_warmup_steps, self.total_steps)
+        if config.schedule == "wsd":
+            self.scheduler = get_wsd_schedule(
+                self.optimizer,
+                warmup_steps=config.warmup_steps,
+                stable_steps=config.stable_steps,
+                decay_steps=config.decay_steps,
+                max_lr=config.max_lr,
+                min_lr=config.min_lr,
+            )
+            logger.info(
+                f"Using WSD schedule: warmup={config.warmup_steps}, "
+                f"stable={config.stable_steps}, decay={config.decay_steps}, "
+                f"max_lr={config.max_lr:.2e}, min_lr={config.min_lr:.2e}"
+            )
+        else:
+            num_warmup_steps = int(self.total_steps * config.warmup_ratio)
+            min_lr_ratio = config.min_lr / config.max_lr
+            self.scheduler = self._get_cosine_schedule(
+                num_warmup_steps, self.total_steps, min_lr_ratio=min_lr_ratio
+            )
+            logger.info(
+                f"Using cosine schedule: warmup={num_warmup_steps}, "
+                f"total={self.total_steps}, "
+                f"max_lr={config.max_lr:.2e}, min_lr={config.min_lr:.2e}"
+            )
 
         # Prepare with Accelerate
         (
@@ -434,7 +470,7 @@ class DistributedTrainer:
         self,
         num_warmup_steps: int,
         num_training_steps: int,
-        min_lr_ratio: float = 0.1,
+        min_lr_ratio: float = 0.1,  # overridden by caller when max_lr/min_lr are set
     ) -> torch.optim.lr_scheduler.LambdaLR:
         """Cosine schedule with warmup."""
 
@@ -449,14 +485,12 @@ class DistributedTrainer:
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
-        """Single training step."""
-        self.model.train()
-
+        """Single training step. Caller is responsible for setting train mode."""
         with self.accelerator.accumulate(self.model):
             input_ids = batch["input_ids"]
             labels = batch["labels"]
 
-            logits, _ = self.model(input_ids)
+            logits, memory_state = self.model(input_ids)
             loss = nn.functional.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 labels.view(-1),
@@ -474,7 +508,18 @@ class DistributedTrainer:
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
 
-        return {"loss": loss.item(), "ppl": math.exp(loss.item())}
+        metrics: dict[str, float] = {"loss": loss.item(), "ppl": math.exp(loss.item())}
+
+        # Monitor first memory layer weight norm.
+        # TitansMAG.forward returns list[MemoryState]; MemoryState.weights is list[Tensor].
+        if memory_state and memory_state[0] is not None:
+            first_state = memory_state[0]
+            if first_state.weights:
+                metrics["memory_norm"] = (
+                    first_state.weights[0].detach().float().norm().item()
+                )
+
+        return metrics
 
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
@@ -521,31 +566,36 @@ class DistributedTrainer:
         """Save checkpoint."""
         self.accelerator.wait_for_everyone()
 
+        # save_state is a collective operation under FSDP — all ranks must call it.
+        path = self.checkpoint_dir / f"{name}"
+        self.accelerator.save_state(str(path))
+
+        # scheduler.pt: only main process writes, but scheduler state is replicated
+        # across ranks so any rank's state_dict is identical.
         if self.accelerator.is_main_process:
-            path = self.checkpoint_dir / f"{name}"
-
-            # Unwrap model
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
-
-            # Save
-            self.accelerator.save_state(str(path))
-
-            # Also save model weights separately for inference
+            scheduler_path = path / "scheduler.pt"
             torch.save(
                 {
-                    "model_state_dict": unwrapped_model.state_dict(),
-                    "config": vars(self.config),
-                    "model_type": self.config.model_type,
+                    "scheduler_state_dict": self.scheduler.state_dict(),
                     "global_step": self.global_step,
+                    "epoch": self.epoch,
                 },
-                path / "model.pt",
+                scheduler_path,
             )
-
             logger.info(f"Saved checkpoint to {path}")
 
     def load_checkpoint(self, path: Path) -> None:
         """Load checkpoint."""
         self.accelerator.load_state(str(path))
+        # Restore scheduler state for accurate LR after resume
+        scheduler_path = path / "scheduler.pt"
+        if scheduler_path.exists():
+            scheduler_state = torch.load(scheduler_path, map_location="cpu", weights_only=True)
+            self.scheduler.load_state_dict(scheduler_state["scheduler_state_dict"])
+            self.global_step = scheduler_state["global_step"]
+            # epoch is incremented at the top of the while loop, so restore one step back
+            # so the first iteration restores the correct epoch value.
+            self.epoch = max(0, scheduler_state["epoch"] - 1)
         logger.info(f"Loaded checkpoint from {path}")
 
     def train(self) -> None:
@@ -565,6 +615,9 @@ class DistributedTrainer:
 
         while self.global_step < self.total_steps:
             self.epoch += 1
+            # Notify dataset of new epoch for re-shuffling (no-op for IterableDataset).
+            if hasattr(self.train_dataloader.dataset, "set_epoch"):
+                self.train_dataloader.dataset.set_epoch(self.epoch)
 
             for batch in self.train_dataloader:
                 if self.global_step >= self.total_steps:
@@ -591,14 +644,15 @@ class DistributedTrainer:
                                 }
                             )
 
-                            self.accelerator.log(
-                                {
-                                    "train/loss": avg_loss,
-                                    "train/ppl": math.exp(avg_loss),
-                                    "train/lr": current_lr,
-                                },
-                                step=self.global_step,
-                            )
+                            log_dict: dict = {
+                                "train/loss": avg_loss,
+                                "train/ppl": math.exp(avg_loss),
+                                "train/lr": current_lr,
+                            }
+                            if "memory_norm" in metrics:
+                                log_dict["train/memory_norm"] = metrics["memory_norm"]
+
+                            self.accelerator.log(log_dict, step=self.global_step)
 
                         running_loss = 0.0
                         running_count = 0
@@ -609,14 +663,18 @@ class DistributedTrainer:
                         and self.global_step % self.config.eval_every == 0
                     ):
                         val_metrics = self.evaluate()
-                        if val_metrics and self.accelerator.is_main_process:
-                            logger.info(
-                                f"Step {self.global_step}: "
-                                f"val_loss={val_metrics['val_loss']:.4f}, "
-                                f"val_ppl={val_metrics['val_ppl']:.2f}"
-                            )
-                            self.accelerator.log(val_metrics, step=self.global_step)
+                        if val_metrics:
+                            if self.accelerator.is_main_process:
+                                logger.info(
+                                    f"Step {self.global_step}: "
+                                    f"val_loss={val_metrics['val_loss']:.4f}, "
+                                    f"val_ppl={val_metrics['val_ppl']:.2f}"
+                                )
+                                self.accelerator.log(val_metrics, step=self.global_step)
 
+                            # best_val_loss must be updated on ALL ranks identically.
+                            # evaluate() uses all_gather so val_metrics is the same everywhere.
+                            # save_checkpoint is collective — must be called by all ranks.
                             if val_metrics["val_loss"] < self.best_val_loss:
                                 self.best_val_loss = val_metrics["val_loss"]
                                 self.save_checkpoint("best_model")
@@ -672,6 +730,12 @@ def main() -> None:
     parser.add_argument("--dataset-subset", type=str, default=None)
     parser.add_argument("--local-dataset", type=str, default=None, help="Pre-tokenized local dataset (Arrow format)")
     parser.add_argument("--data", type=str, default=None)
+    parser.add_argument(
+        "--bin-data",
+        type=str,
+        default=None,
+        help="Path to YAML file specifying binary token shard sources and weights",
+    )
     parser.add_argument("--tokenizer", type=str, default="gpt2")
     parser.add_argument("--seq-len", type=int, default=4096)
 
@@ -680,10 +744,23 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=4e-4)
+    parser.add_argument("--max-lr", type=float, default=3e-4, help="Peak learning rate")
+    parser.add_argument("--min-lr", type=float, default=3e-5, help="Final learning rate after decay")
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--warmup-ratio", type=float, default=0.03)
+
+    # LR Schedule
+    parser.add_argument(
+        "--schedule",
+        type=str,
+        default="cosine",
+        choices=["cosine", "wsd"],
+        help="Learning rate schedule type",
+    )
+    parser.add_argument("--warmup-steps", type=int, default=2000, help="Warmup steps for WSD schedule")
+    parser.add_argument("--stable-steps", type=int, default=65500, help="Stable steps for WSD schedule")
+    parser.add_argument("--decay-steps", type=int, default=7500, help="Decay steps for WSD schedule")
 
     # Precision
     parser.add_argument(
@@ -725,16 +802,22 @@ def main() -> None:
         dataset_subset=args.dataset_subset,
         local_dataset=args.local_dataset,
         data_path=args.data,
+        bin_data=args.bin_data,
         tokenizer=args.tokenizer,
         seq_len=args.seq_len,
         epochs=args.epochs,
         max_steps=args.max_steps,
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
-        lr=args.lr,
+        max_lr=args.max_lr,
+        min_lr=args.min_lr,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         warmup_ratio=args.warmup_ratio,
+        schedule=args.schedule,
+        warmup_steps=args.warmup_steps,
+        stable_steps=args.stable_steps,
+        decay_steps=args.decay_steps,
         mixed_precision=args.precision,
         gradient_checkpointing=args.gradient_checkpointing,
         checkpoint_dir=args.checkpoint_dir,
@@ -749,18 +832,46 @@ def main() -> None:
         num_workers=args.num_workers,
     )
 
-    # Load tokenizer
+    # Create dataset (priority: bin_data > local_dataset > streaming > text file > synthetic)
+    # NOTE: when using --bin-data, tokenizer is not needed and must NOT override vocab_size.
     tokenizer = None
-    if config.tokenizer and HAS_TRANSFORMERS:
-        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-        config.vocab_size = tokenizer.vocab_size
-
-    # Create dataset (prioritize local pre-tokenized dataset)
-    if config.local_dataset and HAS_DATASETS:
+    if config.bin_data:
+        with open(config.bin_data, "r") as f:
+            mix_cfg = yaml.safe_load(f)
+        sources = mix_cfg.get("sources", [])
+        datasets_list = []
+        weights_list = []
+        for src in sources:
+            path = Path(src["path"])
+            weight = float(src.get("weight", 1.0))
+            try:
+                ds = BinaryTokenDataset.from_directory(path, config.seq_len, config.seed)
+                datasets_list.append(ds)
+                weights_list.append(weight)
+                logger.info(
+                    f"Loaded binary dataset: {path} "
+                    f"({ds.total_tokens/1e9:.2f}B tokens, weight={weight})"
+                )
+            except FileNotFoundError:
+                logger.warning(f"Binary dataset not found, skipping: {path}")
+        if not datasets_list:
+            raise RuntimeError("No binary datasets loaded. Check --bin-data paths.")
+        train_dataset = WeightedMixDataset(
+            datasets_list, weights_list, temperature=0.7, seed=config.seed
+        )
+        logger.info(
+            f"WeightedMixDataset: {len(datasets_list)} sources, "
+            f"probs={[f'{p:.3f}' for p in train_dataset.source_probs]}"
+        )
+    elif config.local_dataset and HAS_DATASETS:
         train_dataset = LocalHFDataset(config.local_dataset, config.seq_len)
     elif config.dataset and HAS_DATASETS:
+        # Only load tokenizer for HF streaming / text-file paths that actually need it
+        if config.tokenizer and HAS_TRANSFORMERS:
+            tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+            config.vocab_size = tokenizer.vocab_size
         train_dataset = StreamingDataset(
             config.dataset,
             tokenizer,
@@ -768,6 +879,11 @@ def main() -> None:
             config.dataset_subset,
         )
     elif config.data_path:
+        if config.tokenizer and HAS_TRANSFORMERS and tokenizer is None:
+            tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+            config.vocab_size = tokenizer.vocab_size
         if tokenizer:
             train_dataset = TextFileDataset(
                 Path(config.data_path), tokenizer, config.seq_len
@@ -785,14 +901,14 @@ def main() -> None:
         )
 
     # Create dataloader
+    is_iterable = isinstance(train_dataset, IterableDataset)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
-        num_workers=config.num_workers
-        if not isinstance(train_dataset, IterableDataset)
-        else 0,
+        num_workers=config.num_workers,
         pin_memory=True,
-        shuffle=not isinstance(train_dataset, IterableDataset),
+        shuffle=not is_iterable,
+        persistent_workers=config.num_workers > 0 and not is_iterable,
     )
 
     # Create model config
@@ -805,6 +921,7 @@ def main() -> None:
         window_size=config.window_size,
         num_persistent_tokens=config.num_persistent_tokens,
         num_memory_layers=config.num_memory_layers,
+        dropout=0.0,  # no dropout for pretraining
     )
 
     # Create model

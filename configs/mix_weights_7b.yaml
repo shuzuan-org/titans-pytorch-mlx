@@ -1,0 +1,17 @@
+# Data mixture weights for 7B pretraining (300B tokens target)
+# Weights represent relative sampling probability (temperature-scaled internally)
+sources:
+  - path: /home/shuzuan/tokens/longwanjuan_en
+    weight: 100.0   # LongWanjuan EN ~100B tokens target
+  - path: /home/shuzuan/tokens/longwanjuan_zh
+    weight: 20.0    # LongWanjuan ZH ~20B tokens target
+  - path: /home/shuzuan/tokens/wanjuan_zh
+    weight: 60.0    # WanJuan ZH (books_zh) ~60B tokens target
+  - path: /home/shuzuan/tokens/skypile
+    weight: 80.0    # SkyPile ZH ~80B tokens target
+  - path: /home/shuzuan/tokens/arxiv
+    weight: 15.0    # ArXiv EN ~15B tokens target
+  - path: /home/shuzuan/tokens/gutenberg
+    weight: 10.0    # Gutenberg EN ~10B tokens target
+  - path: /home/shuzuan/tokens/wiki
+    weight: 15.0    # Wikipedia multi-lingual ~15B tokens target

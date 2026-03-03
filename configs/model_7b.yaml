@@ -1,0 +1,18 @@
+# TitansMAG 7B model configuration
+model_type: mag
+
+# Architecture
+dim: 3584
+num_heads: 28          # head_dim = 128
+num_layers: 24
+ffn_mult: 3.5          # ffn_dim = 3584 * 3.5 = 12544
+num_memory_layers: 2   # memory MLP depth
+memory_hidden_mult: 4.0
+vocab_size: 152064     # Qwen2 tokenizer
+window_size: 4096
+max_seq_len: 8192
+dropout: 0.0           # no dropout for pretraining
+use_rope: true
+
+# Parameter count estimate: ~7.5B
+# Each MAGBlock ≈ 289M params × 24 layers + embedding 545M

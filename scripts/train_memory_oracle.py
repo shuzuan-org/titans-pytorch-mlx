@@ -89,11 +89,19 @@ log = logging.getLogger(__name__)
 # 特殊 token
 # ---------------------------------------------------------------------------
 
-# 从 memory_oracle 导入，确保训练/推理格式严格一致
-from titans.memory_oracle import MEMORY_SYS_PROMPT as SYS_PROMPT  # noqa: E402
-from titans.memory_oracle import _WRITE_PREFIX as WRITE_PREFIX     # noqa: E402
-from titans.memory_oracle import _READ_PREFIX as READ_PREFIX       # noqa: E402
-from titans.memory_oracle import _TARGET_PREFIX as TARGET_PREFIX   # noqa: E402
+# 从 memory_oracle 导入，确保训练/推理格式严格一致。
+# --lang en 时使用英文常量（[WRITE]/[QUERY]/[MEMORY]），zh 使用中文常量（默认）。
+# 此处先导入全部，在 main() 中根据 args.lang 赋值到模块级变量。
+from titans.memory_oracle import MEMORY_SYS_PROMPT as SYS_PROMPT   # noqa: E402
+from titans.memory_oracle import _WRITE_PREFIX as WRITE_PREFIX      # noqa: E402
+from titans.memory_oracle import _READ_PREFIX as READ_PREFIX        # noqa: E402
+from titans.memory_oracle import _TARGET_PREFIX as TARGET_PREFIX    # noqa: E402
+from titans.memory_oracle import (                                   # noqa: E402
+    MEMORY_SYS_PROMPT_EN,
+    _WRITE_PREFIX_EN,
+    _READ_PREFIX_EN,
+    _TARGET_PREFIX_EN,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +702,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-8bit-adam", action="store_true")
     p.add_argument("--multi-gpu", action="store_true",
                    help="Enable multi-GPU DDP (launch with torchrun --nproc_per_node=N)")
+    p.add_argument("--lang", default="zh", choices=["zh", "en"],
+                   help="Training language: zh=Chinese markers (default), en=English markers")
 
     return p.parse_args()
 
@@ -717,6 +727,18 @@ def main() -> None:
         args.max_steps = defaults["max_steps"]
     if args.batch_size is None:
         args.batch_size = defaults["batch_size"]
+
+    # 根据 --lang 切换模块级 prompt 常量，使 OracleDataset 使用正确的格式。
+    # globals() 修改生效于 OracleDataset 创建之前（在 __init__ 中缓存 _sys_ids）。
+    if args.lang == "en":
+        g = globals()
+        g["SYS_PROMPT"]    = MEMORY_SYS_PROMPT_EN
+        g["WRITE_PREFIX"]  = _WRITE_PREFIX_EN
+        g["READ_PREFIX"]   = _READ_PREFIX_EN
+        g["TARGET_PREFIX"] = _TARGET_PREFIX_EN
+        log.info("Language: EN  markers=[WRITE]/[QUERY]/[MEMORY]")
+    else:
+        log.info("Language: ZH  markers=【写入】/【查询】/【记忆】")
 
     log.info("=== Memory Oracle Stage %d ===", args.stage)
     log.info("  model=%s  lr=%.1e  steps=%d  batch=%d  accum=%d",

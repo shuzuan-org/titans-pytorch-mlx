@@ -69,6 +69,22 @@ MEMORY_SYS_PROMPT = _SYS_PROMPT
 MEMORY_WRITE_TEMPLATE = _WRITE_PREFIX + "{message}\n"
 MEMORY_READ_TEMPLATE = _READ_PREFIX + "{query}\n" + _TARGET_PREFIX
 
+# ---------------------------------------------------------------------------
+# English prompt constants (for English from-scratch training)
+# ---------------------------------------------------------------------------
+
+_SYS_PROMPT_EN = (
+    "You are a memory assistant. Record and recall key information from conversation history. "
+    "In [WRITE] mode, update memory. In [QUERY] mode, generate a concise memory summary."
+)
+_WRITE_PREFIX_EN = "[WRITE]"
+_READ_PREFIX_EN = "[QUERY]"
+_TARGET_PREFIX_EN = "[MEMORY]"
+
+MEMORY_SYS_PROMPT_EN = _SYS_PROMPT_EN
+MEMORY_WRITE_TEMPLATE_EN = _WRITE_PREFIX_EN + "{message}\n"
+MEMORY_READ_TEMPLATE_EN = _READ_PREFIX_EN + "{query}\n" + _TARGET_PREFIX_EN
+
 
 # ---------------------------------------------------------------------------
 # MemoryOracle

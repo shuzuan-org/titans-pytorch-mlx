@@ -146,6 +146,182 @@ QUERY_TYPES = [
     "待解问题",       # 还有哪些未解决的问题
 ]
 
+# ---------------------------------------------------------------------------
+# English topic pool & prompts
+# ---------------------------------------------------------------------------
+
+TOPICS_PERSONAL_EN = [
+    "job search, career change and interview prep",
+    "promotion negotiation and salary discussion",
+    "starting a side business from scratch",
+    "romantic relationship development and dating decisions",
+    "marriage planning and family building",
+    "breakup recovery and emotional rebuilding",
+    "parent-child conflict and generational gap",
+    "fitness routine and weight management",
+    "chronic illness management and recovery",
+    "mental health and anxiety management",
+    "graduate school prep and study planning",
+    "studying abroad: application and preparation",
+    "home buying, mortgage and moving",
+    "personal finance, investing and budgeting",
+    "travel planning and destination choices",
+    "pet care and health management",
+    "social anxiety and building relationships",
+    "friendship maintenance and social circle changes",
+]
+
+TOPICS_WORK_EN = [
+    "project milestones and progress updates",
+    "client relationship management and changing requirements",
+    "team conflict and staff changes",
+    "technical architecture decisions and refactoring",
+    "product iteration and user feedback",
+    "business negotiation and contract signing",
+    "budget planning and resource allocation",
+    "performance review and promotion",
+    "cross-team collaboration and communication",
+    "onboarding and team building",
+    "crisis management and incident response",
+    "competitive analysis and market changes",
+    "fundraising progress and investor communications",
+    "data analysis and decision-making",
+]
+
+TOPICS_LIFE_EN = [
+    "relocating to a new city and adjusting",
+    "career plateau and midlife transition",
+    "caring for a sick family member",
+    "grief and coping with major loss",
+    "unexpected windfall and life turning point",
+    "chronic stress accumulation and burnout recovery",
+    "values conflict and life choices",
+    "retirement planning and next chapter",
+]
+
+ALL_TOPICS_EN = TOPICS_PERSONAL_EN + TOPICS_WORK_EN + TOPICS_LIFE_EN
+
+TIME_SPANS_EN = [
+    ("within a week", 2),
+    ("over a month", 3),
+    ("over three months", 4),
+    ("over six months", 5),
+    ("over a year", 6),
+]
+
+QUERY_TYPES_EN = [
+    "current status",
+    "key events",
+    "how things changed",
+    "decision advice based on history",
+    "emotional state",
+    "relationship or project progress",
+    "unresolved issues",
+]
+
+SYSTEM_PROMPT_EN = """You are an expert at generating memory training data. \
+Your data is used to train an AI long-term memory module.
+
+Core requirements:
+- target_memory must be a "memory summary", NOT a conversational reply
+- write entries must include unrelated daily noise so the model learns to filter
+- write entries should have time labels to show temporal order
+- later sessions should naturally reference earlier events"""
+
+STAGE1_PROMPT_EN = """Generate one memory training sample (warm-up stage).
+
+Topic: {topic}
+Requirements:
+1. Write entries: 4-8 total, time span about one week, natural language with time labels
+2. 1-3 important entries (related to the query); rest are daily noise (unrelated)
+3. query: a question about the important content
+4. target_memory: concise summary of only the important content (under 50 words)
+
+Important: target_memory is a MEMORY SUMMARY, not an answer. Format: "The user [did/experienced/is]..."
+
+Output strictly as JSON, no extra text:
+{{
+  "writes": [
+    {{"time": "Monday", "content": "...", "is_noise": false}},
+    {{"time": "Tuesday", "content": "Had takeout for lunch", "is_noise": true}},
+    ...
+  ],
+  "query": "...",
+  "target_memory": "The user ..."
+}}"""
+
+STAGE2_PROMPT_EN = """Generate one memory training sample (multi-session stage).
+
+Topic: {topic}
+Time span: {time_span}
+Number of sessions: {n_sessions}
+Query type: {query_type}
+
+Requirements:
+1. Write entries: 10-20 total, across {n_sessions} sessions, 2-5 entries per session
+2. Important entries (2-5): key events that affect the user's life or decisions; must be referenced in later sessions
+3. Noise entries (6-12): unrelated daily trivia
+4. At least 1 cross-session reference ("like I mentioned before", "remember when I said...")
+5. For "how things changed" or "current status" queries: same entity should update across sessions
+
+target_memory requirements:
+- Summarize only entries relevant to the query
+- Ignore noise
+- Under 100 words, natural language
+- Describe background memory, not answer the query directly
+
+Output strictly as JSON, no extra text:
+{{
+  "sessions": [
+    {{
+      "session_id": 1,
+      "time_label": "3 months ago",
+      "writes": [
+        {{"content": "...", "is_noise": false}},
+        {{"content": "Nice weather today", "is_noise": true}}
+      ]
+    }}
+  ],
+  "query": "...",
+  "target_memory": "..."
+}}"""
+
+STAGE3_PROMPT_EN = """Generate one memory training sample (information update stage).
+
+Topic: {topic}
+Requirements: Show the same entity changing state across time (new info should override old info)
+
+Must include:
+1. The same entity (person/project/relationship/status) at 3 different time points
+   Example: ["Alex is an intern" → "Alex became a full-time engineer" → "Alex was promoted to lead"]
+2. 1-2 noise entries at each time point
+3. query asks about the entity's CURRENT state
+4. target_memory describes only the LATEST state (no history recap)
+
+Output strictly as JSON, no extra text:
+{{
+  "entity": "name of the tracked entity",
+  "updates": [
+    {{
+      "time_label": "6 months ago",
+      "signal": "entity's state description",
+      "noise": ["noise content 1"]
+    }},
+    {{
+      "time_label": "3 months ago",
+      "signal": "updated state",
+      "noise": ["noise content"]
+    }},
+    {{
+      "time_label": "last week",
+      "signal": "latest state",
+      "noise": ["noise content"]
+    }}
+  ],
+  "query": "...",
+  "target_memory": "(latest state only) ..."
+}}"""
+
 
 # ---------------------------------------------------------------------------
 # Prompt 模板
@@ -377,15 +553,22 @@ def _stage3_to_sample(parsed: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-_ASSISTANT_REPLY_STARTS = (
+_ASSISTANT_REPLY_STARTS_ZH = (
     "好的", "当然", "没问题", "我来", "让我", "首先", "您好",
     "根据您", "当然可以", "我认为您", "我来帮", "我可以", "我建议",
     "请问", "非常感谢", "很高兴",
 )
-_ASSISTANT_REPLY_WORDS = ("您", "请您", "如您所")
+_ASSISTANT_REPLY_WORDS_ZH = ("您", "请您", "如您所")
+
+_ASSISTANT_REPLY_STARTS_EN = (
+    "Sure,", "Of course,", "Certainly,", "No problem,", "Let me", "First,",
+    "I'd be happy", "I can help", "I think you", "I recommend", "I suggest",
+    "Thank you for", "Great question",
+)
+_ASSISTANT_REPLY_WORDS_EN = ("you should", "you need to", "I recommend that you")
 
 
-def _validate_sample(sample: dict) -> tuple[bool, str]:
+def _validate_sample(sample: dict, lang: str = "zh") -> tuple[bool, str]:
     """基本质量检查，返回 (is_valid, reason)。"""
     h = sample.get("history", [])
     q = sample.get("query", "")
@@ -408,12 +591,15 @@ def _validate_sample(sample: dict) -> tuple[bool, str]:
         return False, "no noise writes (model won't learn to filter)"
 
     # target 不应该是助手回复风格
-    for bad_start in _ASSISTANT_REPLY_STARTS:
-        if t.startswith(bad_start):
-            return False, f"target looks like assistant reply: {t[:20]}"
-    for word in _ASSISTANT_REPLY_WORDS:
-        if word in t:
-            return False, f"target contains assistant word '{word}': {t[:30]}"
+    bad_starts = _ASSISTANT_REPLY_STARTS_EN if lang == "en" else _ASSISTANT_REPLY_STARTS_ZH
+    bad_words  = _ASSISTANT_REPLY_WORDS_EN  if lang == "en" else _ASSISTANT_REPLY_WORDS_ZH
+    t_lower = t.lower()
+    for bad_start in bad_starts:
+        if t_lower.startswith(bad_start.lower()):
+            return False, f"target looks like assistant reply: {t[:30]}"
+    for word in bad_words:
+        if word.lower() in t_lower:
+            return False, f"target contains assistant phrase '{word}': {t[:40]}"
 
     return True, "ok"
 
@@ -502,21 +688,33 @@ class OpenAIBackend:
 # ---------------------------------------------------------------------------
 
 
-def _build_prompt(stage: int) -> str:
-    topic = random.choice(ALL_TOPICS)
-    if stage == 1:
-        return STAGE1_PROMPT.format(topic=topic)
-    elif stage == 2:
-        span_label, n_sess = random.choice(TIME_SPANS)
-        qtype = random.choice(QUERY_TYPES)
-        return STAGE2_PROMPT.format(
-            topic=topic,
-            time_span=span_label,
-            n_sessions=n_sess,
-            query_type=qtype,
-        )
-    else:  # stage 3
-        return STAGE3_PROMPT.format(topic=topic)
+def _build_prompt(stage: int, lang: str = "zh") -> str:
+    if lang == "en":
+        topic = random.choice(ALL_TOPICS_EN)
+        if stage == 1:
+            return STAGE1_PROMPT_EN.format(topic=topic)
+        elif stage == 2:
+            span_label, n_sess = random.choice(TIME_SPANS_EN)
+            qtype = random.choice(QUERY_TYPES_EN)
+            return STAGE2_PROMPT_EN.format(
+                topic=topic, time_span=span_label,
+                n_sessions=n_sess, query_type=qtype,
+            )
+        else:
+            return STAGE3_PROMPT_EN.format(topic=topic)
+    else:
+        topic = random.choice(ALL_TOPICS)
+        if stage == 1:
+            return STAGE1_PROMPT.format(topic=topic)
+        elif stage == 2:
+            span_label, n_sess = random.choice(TIME_SPANS)
+            qtype = random.choice(QUERY_TYPES)
+            return STAGE2_PROMPT.format(
+                topic=topic, time_span=span_label,
+                n_sessions=n_sess, query_type=qtype,
+            )
+        else:
+            return STAGE3_PROMPT.format(topic=topic)
 
 
 def _parse_and_convert(text: str, stage: int) -> dict | None:
@@ -548,6 +746,7 @@ def generate_samples(
     stage: int,
     n_samples: int,
     output_path: Path,
+    lang: str = "zh",
     retry_limit: int = 3,
     max_consecutive_failures: int = 50,
 ) -> tuple[int, int]:
@@ -578,12 +777,13 @@ def generate_samples(
                 )
                 break
 
-            prompt = _build_prompt(stage)
+            prompt = _build_prompt(stage, lang)
+            sys_prompt = SYSTEM_PROMPT_EN if lang == "en" else SYSTEM_PROMPT
             sample = None
 
             for retry in range(retry_limit):
                 try:
-                    raw = backend.generate(SYSTEM_PROMPT, prompt)
+                    raw = backend.generate(sys_prompt, prompt)
                     sample = _parse_and_convert(raw, stage)
                     if sample is not None:
                         break
@@ -597,7 +797,7 @@ def generate_samples(
                 consecutive_failures += 1
                 continue
 
-            valid, reason = _validate_sample(sample)
+            valid, reason = _validate_sample(sample, lang)
             if not valid:
                 rejected += 1
                 consecutive_failures += 1
@@ -679,6 +879,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--openai-base-url", default=None)
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--lang", default="zh", choices=["zh", "en"],
+                   help="Generation language: zh=Chinese (default), en=English")
     p.add_argument("--validate", action="store_true",
                    help="Validate existing output file instead of generating")
     return p.parse_args()
@@ -702,11 +904,14 @@ def main() -> None:
     else:
         backend = OpenAIBackend(args.openai_model, args.openai_base_url)
 
-    log.info("=== Memory Data v2 Stage %d ===", args.stage)
+    topics_pool = ALL_TOPICS_EN if args.lang == "en" else ALL_TOPICS
+    log.info("=== Memory Data v2 Stage %d [lang=%s] ===", args.stage, args.lang)
     log.info("  backend=%s  n=%d  output=%s", args.backend, args.n_samples, output_path)
-    log.info("  topics pool: %d topics", len(ALL_TOPICS))
+    log.info("  topics pool: %d topics", len(topics_pool))
 
-    count, rejected = generate_samples(backend, args.stage, args.n_samples, output_path)
+    count, rejected = generate_samples(
+        backend, args.stage, args.n_samples, output_path, lang=args.lang
+    )
 
     log.info("Done: %d generated, %d rejected (%.1f%% rejection rate)",
              count, rejected, 100.0 * rejected / max(count + rejected, 1))

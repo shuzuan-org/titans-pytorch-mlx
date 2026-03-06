@@ -284,8 +284,8 @@ def build_model(
                 adapter_cfg = _json.loads(adapter_cfg_path.read_text())
                 model_src = adapter_cfg.get("base_model_name_or_path", args.model)
                 log.info("Resume: using base model %s from adapter_config", model_src)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("Failed to parse adapter_config.json in %s (%s); using --model", resume_dir, e)
 
     log.info("Loading base model: %s", model_src)
     model = AutoModelForCausalLM.from_pretrained(
@@ -329,12 +329,6 @@ def build_model(
     model = get_peft_model(model, lora_cfg)
 
     # ------------------------------------------------------------------
-    # Resume 权重加载
-    # ------------------------------------------------------------------
-    if resume_dir is not None:
-        _load_resume(model, resume_dir, device)
-
-    # ------------------------------------------------------------------
     # 可训练参数
     # ------------------------------------------------------------------
     trainable_params = get_trainable_params(model)
@@ -354,12 +348,15 @@ def _load_resume(
     resume_dir: Path,
     device: str,
     optimizer: torch.optim.Optimizer | None = None,
-) -> None:
+) -> int:
     """从 resume_dir 加载权重：支持 peft final/ 格式和 step_*.pt。
 
     Args:
         optimizer: 若提供，且 checkpoint 含 optimizer_state，则一并恢复。
                    peft 格式无 optimizer state，此参数在 peft 路径下无效。
+
+    Returns:
+        恢复的 opt_step（peft 格式无 step 信息，返回 0）。
     """
     # 先尝试 peft 格式（adapter_config.json 在 resume_dir 本身）
     if (resume_dir / "adapter_config.json").exists():
@@ -388,7 +385,7 @@ def _load_resume(
         n_loaded = len(adapter_state) - len(unexpected)
         log.info("Loaded %d params (missing=%d) from peft adapter: %s",
                  n_loaded, len(missing), resume_dir)
-        return
+        return 0  # peft format has no step info
 
     # Fallback: step_*.pt (keys are saved from peft model.named_parameters() — exact match)
     step_files = sorted(resume_dir.glob("step_*.pt"))
@@ -406,7 +403,10 @@ def _load_resume(
         if optimizer is not None and "optimizer_state" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state"])
             log.info("Optimizer state restored from %s", ckpt_path)
-        log.info("Loaded %d params from step checkpoint: %s", loaded, ckpt_path)
+        restored_step = ckpt.get("step", 0)
+        log.info("Loaded %d params from step checkpoint: %s (step=%d)",
+                 loaded, ckpt_path, restored_step)
+        return restored_step
     else:
         raise RuntimeError(
             f"--resume specified ({resume_dir}) but no loadable checkpoint found "
@@ -548,11 +548,12 @@ def train(
             trainable_params, lr=args.lr, weight_decay=0.1, betas=(0.9, 0.95)
         )
 
-    # Restore optimizer state if resuming from a step_*.pt checkpoint
-    if resume_dir is not None:
-        _load_resume(model, resume_dir, device, optimizer=optimizer)
-
+    # Load weights + optimizer state; restore opt_step so LR schedule and
+    # checkpoint naming continue from the correct position.
     opt_step = 0
+    if resume_dir is not None:
+        opt_step = _load_resume(model, resume_dir, device, optimizer=optimizer)
+        log.info("Resuming training from step %d", opt_step)
     micro_step = 0
     micro_loss = 0.0
     log_loss = 0.0

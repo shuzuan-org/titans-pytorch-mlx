@@ -554,6 +554,12 @@ def train(
     if resume_dir is not None:
         opt_step = _load_resume(model, resume_dir, device, optimizer=optimizer)
         log.info("Resuming training from step %d", opt_step)
+        if opt_step >= args.max_steps:
+            raise RuntimeError(
+                f"Resumed from step {opt_step} but --max-steps={args.max_steps} "
+                "is not greater than the resume point. Training would exit immediately "
+                "and overwrite the existing checkpoint. Pass a larger --max-steps."
+            )
     micro_step = 0
     micro_loss = 0.0
     log_loss = 0.0

@@ -26,11 +26,14 @@ Public API:
 
 from __future__ import annotations
 
+import logging
 import torch
 import torch.nn as nn
 
 from titans.config import TitansConfig
 from titans.memory import MemoryState, NeuralLongTermMemory
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen35LayerWithMemory(nn.Module):
@@ -52,10 +55,12 @@ class Qwen35LayerWithMemory(nn.Module):
         self,
         original_layer: nn.Module,
         memory: NeuralLongTermMemory,
+        layer_idx: int = -1,
     ) -> None:
         super().__init__()
         self.original_layer = original_layer
         self.memory = memory
+        self.layer_idx: int = layer_idx  # stable identity for state save/load
         # State for this layer; reset per-sequence
         self.memory_state: MemoryState | None = None
         # When True: retrieval only, no weight update
@@ -73,7 +78,9 @@ class Qwen35LayerWithMemory(nn.Module):
         except AttributeError:
             modules = self.__dict__.get("_modules", {})
             original = modules.get("original_layer")
-            if original is not None:
+            # Guard against double-wrapping: if original is also a
+            # Qwen35LayerWithMemory its __getattr__ would recurse infinitely.
+            if original is not None and not isinstance(original, Qwen35LayerWithMemory):
                 return getattr(original, name)
             raise AttributeError(
                 f"'{type(self).__name__}' object has no attribute '{name}'"
@@ -179,9 +186,9 @@ def inject_memory_into_qwen35(
     original_layers = text_backbone.model.layers
     new_layers: list[nn.Module] = []
 
-    for layer in original_layers:
+    for idx, layer in enumerate(original_layers):
         memory = NeuralLongTermMemory(mem_cfg).to(dtype=dtype, device=device)
-        new_layers.append(Qwen35LayerWithMemory(layer, memory))
+        new_layers.append(Qwen35LayerWithMemory(layer, memory, layer_idx=idx))
 
     text_backbone.model.layers = nn.ModuleList(new_layers)
     return model
@@ -273,18 +280,16 @@ def get_trainable_params(model: nn.Module) -> list[nn.Parameter]:
 
 
 def get_nlm_states(model: nn.Module) -> dict[int, MemoryState | None]:
-    """Return a dict mapping NLM layer index → MemoryState (or None).
+    """Return a dict mapping layer_idx → MemoryState (or None).
 
-    Keys are 0, 1, 2, ... ordered by position in model.modules() traversal,
-    counting only Qwen35LayerWithMemory instances — NOT the global module index.
+    Keys are the stable layer_idx assigned at injection time, not the
+    model.modules() traversal order (which can change with peft wrapping).
     """
     states: dict[int, MemoryState | None] = {}
-    nlm_idx = 0
     for module in model.modules():
         if isinstance(module, Qwen35LayerWithMemory):
             state = module.memory_state
-            states[nlm_idx] = state.clone() if state is not None else None
-            nlm_idx += 1
+            states[module.layer_idx] = state.clone() if state is not None else None
     return states
 
 
@@ -292,13 +297,13 @@ def set_nlm_states(model: nn.Module, states: dict[int, MemoryState | None]) -> N
     """Restore NLM states previously captured with get_nlm_states().
 
     Tensors are moved to the device of the corresponding NLM module.
-    Keys in `states` must match the sequential NLM-layer indices produced by
-    get_nlm_states() — not arbitrary module indices.
+    Keys in `states` must be the layer_idx values produced by get_nlm_states().
+    Warns if the number of layers in the model differs from len(states).
     """
-    nlm_idx = 0
+    n_restored = 0
     for module in model.modules():
         if isinstance(module, Qwen35LayerWithMemory):
-            state = states.get(nlm_idx)
+            state = states.get(module.layer_idx)
             if state is None:
                 module.memory_state = None
             else:
@@ -307,4 +312,11 @@ def set_nlm_states(model: nn.Module, states: dict[int, MemoryState | None]) -> N
                     weights=[w.to(device) for w in state.weights],
                     momentum=[m.to(device) for m in state.momentum],
                 )
-            nlm_idx += 1
+            n_restored += 1
+
+    if n_restored != len(states):
+        logger.warning(
+            "set_nlm_states: model has %d NLM layers but states dict has %d entries "
+            "— layer count mismatch, some states may be silently dropped",
+            n_restored, len(states),
+        )

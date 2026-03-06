@@ -442,7 +442,13 @@ class NeuralLongTermMemory(nn.Module):
         # Update memory with new key-value pairs
         grads = self._compute_gradients(k, v)
 
-        if HAS_CUDA_OPTIMIZATIONS and k.is_cuda:
+        # CUDA kernel requires scalar gates; (D,) per-dim gates must use the
+        # standard path which handles broadcasting via _broadcast_gate().
+        # Passing (D,) to the kernel could silently produce wrong shapes.
+        gates_are_scalar = (
+            not isinstance(alpha_s, torch.Tensor) or alpha_s.dim() == 0
+        )
+        if HAS_CUDA_OPTIMIZATIONS and k.is_cuda and gates_are_scalar:
             try:
                 new_weights, new_momentum = batched_memory_update(
                     state.weights, state.momentum, grads, alpha_s, eta_s, theta_s

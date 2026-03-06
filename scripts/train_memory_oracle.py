@@ -374,8 +374,11 @@ def _load_resume(model: nn.Module, resume_dir: Path, device: str) -> None:
         from peft import set_peft_model_state_dict
         result = set_peft_model_state_dict(model, adapter_state, adapter_name="default")
         unexpected = getattr(result, "unexpected_keys", [])
+        missing = getattr(result, "missing_keys", [])
         if unexpected:
             log.warning("Unexpected keys when loading adapter: %s", unexpected[:5])
+        if missing:
+            log.warning("Missing keys when loading adapter: %s", missing[:5])
         n_loaded = len(adapter_state) - len(unexpected)
         log.info("Loaded %d params from peft adapter: %s", n_loaded, resume_dir)
         return

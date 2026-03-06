@@ -351,25 +351,24 @@ class NeuralLongTermMemory(nn.Module):
         ]
 
     def init_state(self, _batch_size: int, _device: torch.device) -> MemoryState:
-        """Initialize memory state.
+        """Initialize memory state with zero weights and zero momentum.
+
+        Memory starts empty; content accumulates only through write() calls.
+        Using zero weights ensures:
+        - retrieve() returns zero before any writes (mem_out = 0, no corruption)
+        - Baseline "no write" tests are truly clean slates
+        - MemoryMLP structural params (not in optimizer) won't pollute state
 
         Args:
             _batch_size: Batch size (reserved for future per-sample memory)
             _device: Device for tensors (reserved for future use)
 
         Returns:
-            Initial memory state
+            Initial memory state (all zeros)
         """
-        # Initialize weights from the memory module
-        weights = self.memory.get_weights()
-
-        # Expand for batch dimension - weights are shared across batch
-        # but we might want per-sample memory in some cases
-        weights = [w.clone() for w in weights]
-
-        # Initialize momentum to zeros
-        momentum = [torch.zeros_like(w) for w in weights]
-
+        ref_weights = self.memory.get_weights()
+        weights   = [torch.zeros_like(w) for w in ref_weights]
+        momentum  = [torch.zeros_like(w) for w in ref_weights]
         return MemoryState(weights=weights, momentum=momentum)
 
     def forward(

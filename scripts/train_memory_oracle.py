@@ -360,56 +360,44 @@ def _load_resume(model: nn.Module, resume_dir: Path, device: str) -> None:
         adapter_state_path = resume_dir / "adapter_model.safetensors"
         if not adapter_state_path.exists():
             adapter_state_path = resume_dir / "adapter_model.bin"
-        if adapter_state_path.exists():
-            try:
-                try:
-                    from safetensors.torch import load_file as load_safetensors
-                    adapter_state = load_safetensors(str(adapter_state_path), device=device)
-                except ImportError:
-                    adapter_state = torch.load(adapter_state_path, map_location=device, weights_only=True)
-                all_params = dict(model.named_parameters())
-                loaded = 0
-                for name, tensor in adapter_state.items():
-                    # Saved name: ...lora_A.weight
-                    # Model name: ...lora_A.default.weight  (peft inserts adapter name)
-                    candidates = [
-                        name,
-                        name.replace(".lora_A.", ".lora_A.default.").replace(".lora_B.", ".lora_B.default."),
-                        name.replace("base_model.model.", "", 1),
-                        name.replace("base_model.model.", "", 1).replace(".lora_A.", ".lora_A.default.").replace(".lora_B.", ".lora_B.default."),
-                    ]
-                    for cand in candidates:
-                        if cand in all_params:
-                            all_params[cand].data.copy_(tensor.to(all_params[cand].device))
-                            loaded += 1
-                            break
-                log.info("Loaded %d params from peft adapter: %s", loaded, resume_dir)
-                return  # 加载成功，无需 fallback
-            except Exception as e:
-                log.warning("peft adapter load failed (%s), trying step_*.pt", e)
-        else:
-            log.warning(
-                "adapter_config.json found but no weights file in %s; falling back to step_*.pt",
-                resume_dir,
+        if not adapter_state_path.exists():
+            raise RuntimeError(
+                f"adapter_config.json found in {resume_dir} but no weights file "
+                "(expected adapter_model.safetensors or adapter_model.bin)"
             )
+        try:
+            from safetensors.torch import load_file as load_safetensors
+            adapter_state = load_safetensors(str(adapter_state_path), device=device)
+        except ImportError:
+            adapter_state = torch.load(adapter_state_path, map_location=device, weights_only=True)
+        # Use peft's own API to handle naming conventions (adapter name injection, etc.)
+        from peft import set_peft_model_state_dict
+        result = set_peft_model_state_dict(model, adapter_state, adapter_name="default")
+        unexpected = getattr(result, "unexpected_keys", [])
+        if unexpected:
+            log.warning("Unexpected keys when loading adapter: %s", unexpected[:5])
+        n_loaded = len(adapter_state) - len(unexpected)
+        log.info("Loaded %d params from peft adapter: %s", n_loaded, resume_dir)
+        return
 
-    # Fallback: step_*.pt
+    # Fallback: step_*.pt (keys are saved from peft model.named_parameters() — exact match)
     step_files = sorted(resume_dir.glob("step_*.pt"))
     if step_files:
         ckpt_path = step_files[-1]
         log.info("Resuming from checkpoint: %s", ckpt_path)
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         all_params = dict(model.named_parameters())
+        loaded = 0
         for key in ("memory_state", "lora_state"):
             for name, tensor in ckpt.get(key, {}).items():
-                name_clean = name.replace("base_model.model.", "", 1)
-                if name_clean in all_params:
-                    all_params[name_clean].data.copy_(tensor.to(all_params[name_clean].device))
+                if name in all_params:
+                    all_params[name].data.copy_(tensor.to(all_params[name].device))
+                    loaded += 1
+        log.info("Loaded %d params from step checkpoint: %s", loaded, ckpt_path)
     else:
-        log.error(
-            "--resume specified (%s) but no loadable checkpoint found "
-            "(no .safetensors/.bin and no step_*.pt); training starts from random NLM init!",
-            resume_dir,
+        raise RuntimeError(
+            f"--resume specified ({resume_dir}) but no loadable checkpoint found "
+            "(no adapter_config.json, no .safetensors/.bin, and no step_*.pt)"
         )
 
 

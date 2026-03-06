@@ -70,9 +70,9 @@ READY_RATIO = 0.90
 
 # 三阶段训练超参
 STAGE_HPS: dict[int, dict] = {
-    1: {"lr": "1e-4",  "max_steps": 5000,  "save_steps": 1000},
-    2: {"lr": "5e-5",  "max_steps": 10000, "save_steps": 2000},
-    3: {"lr": "2e-5",  "max_steps": 3000,  "save_steps": 600},
+    1: {"lr": "1e-4",  "max_steps": 5000,  "save_steps": 1000, "seq_len": 2048},
+    2: {"lr": "5e-5",  "max_steps": 10000, "save_steps": 2000, "seq_len": 4096},
+    3: {"lr": "2e-5",  "max_steps": 3000,  "save_steps": 600,  "seq_len": 4096},
 }
 
 
@@ -201,6 +201,7 @@ def run_stage(
         "--num-memory-layers", "1",
         "--batch-size", "1",
         "--grad-accum", "4",
+        "--seq-len", str(hps["seq_len"]),
         "--use-8bit-adam",
         "--multi-gpu",
         *build_data_args(data_root, stage, langs),

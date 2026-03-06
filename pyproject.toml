@@ -38,6 +38,7 @@ train = [
     "datasets>=2.16.0",
     "wandb>=0.16.0",
     "accelerate>=0.25.0",
+    "peft>=0.9.0",
 ]
 hub = [
     "huggingface_hub>=0.20.0",

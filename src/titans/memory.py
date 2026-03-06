@@ -327,28 +327,23 @@ class NeuralLongTermMemory(nn.Module):
         # Use torch.enable_grad() to compute gradients even in inference mode
         # This is essential because Titans learns at test time
         with torch.enable_grad():
-            # Enable gradients for weight computation
             for param in self.memory.parameters():
                 param.requires_grad_(True)
-
-            # Detach inputs and re-enable gradients for gradient computation
-            keys_grad = keys.detach().requires_grad_(True)
-            values_grad = values.detach()
-
-            # Compute loss
-            loss = self.memory.compute_loss(keys_grad, values_grad)
-
-            # Compute gradients
-            grads = torch.autograd.grad(
-                loss,
-                list(self.memory.parameters()),
-                create_graph=False,
-                allow_unused=True,
-            )
-
-            # Disable gradients
-            for param in self.memory.parameters():
-                param.requires_grad_(False)
+            try:
+                keys_grad = keys.detach().requires_grad_(True)
+                values_grad = values.detach()
+                loss = self.memory.compute_loss(keys_grad, values_grad)
+                grads = torch.autograd.grad(
+                    loss,
+                    list(self.memory.parameters()),
+                    create_graph=False,
+                    allow_unused=True,
+                )
+            finally:
+                # Always restore requires_grad=False; leaking True would cause
+                # AdamW to pick up gradients on Titans-managed weights.
+                for param in self.memory.parameters():
+                    param.requires_grad_(False)
 
         return [
             g if g is not None else torch.zeros_like(p)

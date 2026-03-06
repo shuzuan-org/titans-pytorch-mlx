@@ -55,7 +55,7 @@ class Qwen35LayerWithMemory(nn.Module):
         self,
         original_layer: nn.Module,
         memory: NeuralLongTermMemory,
-        layer_idx: int = -1,
+        layer_idx: int,
     ) -> None:
         super().__init__()
         self.original_layer = original_layer

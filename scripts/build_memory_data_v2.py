@@ -51,6 +51,8 @@ import random
 import re
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -662,12 +664,22 @@ class LocalBackend:
 
 
 class OpenAIBackend:
-    def __init__(self, model: str = "gpt-4o-mini", base_url: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str = "gpt-4o-mini",
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
         try:
             import openai
         except ImportError:
             raise ImportError("openai package required: pip install openai")
-        self.client = openai.OpenAI(base_url=base_url) if base_url else openai.OpenAI()
+        kwargs: dict = {}
+        if base_url:
+            kwargs["base_url"] = base_url
+        if api_key:
+            kwargs["api_key"] = api_key
+        self.client = openai.OpenAI(**kwargs)
         self.model = model
 
     def generate(self, system: str, user: str, max_new_tokens: int = 2048) -> str:
@@ -741,6 +753,93 @@ def _count_existing(path: Path) -> int:
     return count
 
 
+def _generate_samples_concurrent(
+    backend: Any,
+    stage: int,
+    n_samples: int,
+    output_path: Path,
+    lang: str,
+    retry_limit: int,
+    concurrency: int,
+) -> tuple[int, int]:
+    """多线程并发版本，适用于 API backend（如 OpenAI 兼容接口）。
+
+    主线程负责收集结果写文件，worker 线程只做 API 调用 + JSON 解析。
+    支持动态补充 worker：每完成一个样本就提交一个新任务，保持 pool 满载。
+    """
+    already = _count_existing(output_path)
+    if already >= n_samples:
+        log.info("Already have %d >= %d, nothing to do.", already, n_samples)
+        return 0, 0
+    remaining = n_samples - already
+    log.info("Concurrent [workers=%d]: need %d more.", concurrency, remaining)
+
+    sys_prompt = SYSTEM_PROMPT_EN if lang == "en" else SYSTEM_PROMPT
+
+    def try_one() -> dict | None:
+        """一次 API 调用，返回有效样本或 None（解析失败/验证失败均返回 None）。"""
+        prompt = _build_prompt(stage, lang)
+        for retry in range(retry_limit):
+            try:
+                raw = backend.generate(sys_prompt, prompt)
+                sample = _parse_and_convert(raw, stage)
+                if sample is not None:
+                    valid, reason = _validate_sample(sample, lang)
+                    if valid:
+                        return sample
+                    log.debug("Rejected: %s", reason)
+                    return None
+                log.debug("Parse failed (retry %d)", retry + 1)
+            except Exception as e:
+                wait = min(2 ** retry, 30)
+                log.warning("API error (retry %d/%d): %s — wait %ds", retry + 1, retry_limit, e, wait)
+                time.sleep(wait)
+        return None
+
+    count = 0
+    rejected = 0
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with output_path.open("a", encoding="utf-8") as f:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            pending: set = set()
+
+            def _fill() -> None:
+                slots = concurrency - len(pending)
+                for _ in range(slots):
+                    pending.add(executor.submit(try_one))
+
+            _fill()
+
+            while count < remaining:
+                done = {fut for fut in pending if fut.done()}
+                if not done:
+                    time.sleep(0.05)
+                    continue
+
+                pending -= done
+                for fut in done:
+                    if count >= remaining:
+                        break
+                    result = fut.result()
+                    if result is not None:
+                        f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                        f.flush()
+                        count += 1
+                        if count % 100 == 0:
+                            log.info(
+                                "Stage %d [concurrent] | total=%d/%d | new=%d | rejected=%d | rate=%.1f%%",
+                                stage, already + count, n_samples, count, rejected,
+                                100.0 * rejected / max(count + rejected, 1),
+                            )
+                    else:
+                        rejected += 1
+
+                _fill()
+
+    return count, rejected
+
+
 def generate_samples(
     backend: Any,
     stage: int,
@@ -749,12 +848,18 @@ def generate_samples(
     lang: str = "zh",
     retry_limit: int = 3,
     max_consecutive_failures: int = 50,
+    concurrency: int = 1,
 ) -> tuple[int, int]:
     """生成 n_samples 条样本，追加写入 output_path。返回 (本次新增数, 本次拒绝数)。
 
+    concurrency > 1 时使用多线程并发模式（适合 API backend）。
     使用追加模式（"a"）——断点续跑安全，不会截断已有数据。
-    启动时统计已有行数，从断点继续直到总量达到 n_samples。
     """
+    if concurrency > 1:
+        return _generate_samples_concurrent(
+            backend, stage, n_samples, output_path, lang, retry_limit, concurrency
+        )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     already = _count_existing(output_path)
@@ -875,8 +980,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--backend", choices=["local", "openai"], default="local")
     p.add_argument("--model", default="Qwen/Qwen3.5-9B-Instruct",
                    help="Local model (for --backend local)")
-    p.add_argument("--openai-model", default="gpt-4o-mini")
+    p.add_argument("--openai-model", default="MiniMax-Text-01")
     p.add_argument("--openai-base-url", default=None)
+    p.add_argument("--openai-api-key", default=None,
+                   help="API key (overrides OPENAI_API_KEY env var)")
+    p.add_argument("--concurrency", type=int, default=1,
+                   help="Concurrent API calls (>1 uses thread pool, recommended for API backend)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--lang", default="zh", choices=["zh", "en"],
@@ -902,7 +1011,7 @@ def main() -> None:
     if args.backend == "local":
         backend = LocalBackend(args.model, args.device)
     else:
-        backend = OpenAIBackend(args.openai_model, args.openai_base_url)
+        backend = OpenAIBackend(args.openai_model, args.openai_base_url, args.openai_api_key)
 
     topics_pool = ALL_TOPICS_EN if args.lang == "en" else ALL_TOPICS
     log.info("=== Memory Data v2 Stage %d [lang=%s] ===", args.stage, args.lang)
@@ -910,7 +1019,8 @@ def main() -> None:
     log.info("  topics pool: %d topics", len(topics_pool))
 
     count, rejected = generate_samples(
-        backend, args.stage, args.n_samples, output_path, lang=args.lang
+        backend, args.stage, args.n_samples, output_path,
+        lang=args.lang, concurrency=args.concurrency,
     )
 
     log.info("Done: %d generated, %d rejected (%.1f%% rejection rate)",

@@ -176,15 +176,11 @@ class OracleDataset(Dataset):
             # Stage 1/2：整体 tokenize，保留跨段 BPE 合并，token 效率更高
             write_text = "".join(WRITE_PREFIX + turn["content"] + "\n" for turn in history)
             all_write_ids = self.tokenizer.encode(write_text, add_special_tokens=False)
-            # 超出 budget 时从头部（最老）截断，保留最近的 write 内容
-            if len(all_write_ids) > write_budget:
-                all_write_ids = all_write_ids[-write_budget:]
-            # 注意：write_budget 可能为 0，此时 all_write_ids[-0:] = all_write_ids（Python 陷阱）
-            # 必须用 <= 0 显式处理，不能依赖切片
+            # write_budget 可能为 0（Python `-0` 陷阱：all[-0:] = all），必须显式处理
             if write_budget <= 0:
                 write_token_ids = []
             elif len(all_write_ids) > write_budget:
-                write_token_ids = all_write_ids[-write_budget:]
+                write_token_ids = all_write_ids[-write_budget:]  # 保留最近的
             else:
                 write_token_ids = all_write_ids
             write_entries = None  # Stage 1/2 不需要 per-entry 追踪
@@ -353,8 +349,18 @@ def build_model(
     return model, trainable_params
 
 
-def _load_resume(model: nn.Module, resume_dir: Path, device: str) -> None:
-    """从 resume_dir 加载权重：支持 peft final/ 格式和 step_*.pt。"""
+def _load_resume(
+    model: nn.Module,
+    resume_dir: Path,
+    device: str,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> None:
+    """从 resume_dir 加载权重：支持 peft final/ 格式和 step_*.pt。
+
+    Args:
+        optimizer: 若提供，且 checkpoint 含 optimizer_state，则一并恢复。
+                   peft 格式无 optimizer state，此参数在 peft 路径下无效。
+    """
     # 先尝试 peft 格式（adapter_config.json 在 resume_dir 本身）
     if (resume_dir / "adapter_config.json").exists():
         adapter_state_path = resume_dir / "adapter_model.safetensors"
@@ -380,7 +386,8 @@ def _load_resume(model: nn.Module, resume_dir: Path, device: str) -> None:
         if missing:
             log.warning("Missing keys when loading adapter: %s", missing[:5])
         n_loaded = len(adapter_state) - len(unexpected)
-        log.info("Loaded %d params from peft adapter: %s", n_loaded, resume_dir)
+        log.info("Loaded %d params (missing=%d) from peft adapter: %s",
+                 n_loaded, len(missing), resume_dir)
         return
 
     # Fallback: step_*.pt (keys are saved from peft model.named_parameters() — exact match)
@@ -396,6 +403,9 @@ def _load_resume(model: nn.Module, resume_dir: Path, device: str) -> None:
                 if name in all_params:
                     all_params[name].data.copy_(tensor.to(all_params[name].device))
                     loaded += 1
+        if optimizer is not None and "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+            log.info("Optimizer state restored from %s", ckpt_path)
         log.info("Loaded %d params from step checkpoint: %s", loaded, ckpt_path)
     else:
         raise RuntimeError(
@@ -475,14 +485,8 @@ def save_checkpoint(
     step: int,
     loss: float,
     output_dir: Path,
-    save_optimizer: bool = False,
 ) -> None:
-    """保存 checkpoint。
-
-    Args:
-        save_optimizer: 是否保存 optimizer state（体积大，仅 final 保存时需要）。
-                        周期性 checkpoint 只保存 memory_state + lora_state 即可。
-    """
+    """保存 checkpoint（memory_state + lora_state + optimizer_state）。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = output_dir / f"step_{step:07d}.pt"
 
@@ -496,10 +500,13 @@ def save_checkpoint(
         for name, param in model.named_parameters()
         if "lora_" in name
     }
-    payload: dict = {"step": step, "loss": loss,
-                     "memory_state": memory_state, "lora_state": lora_state}
-    if save_optimizer:
-        payload["optimizer_state"] = optimizer.state_dict()
+    payload: dict = {
+        "step": step,
+        "loss": loss,
+        "memory_state": memory_state,
+        "lora_state": lora_state,
+        "optimizer_state": optimizer.state_dict(),
+    }
     torch.save(payload, ckpt_path)
     log.info("Saved checkpoint → %s (loss=%.4f)", ckpt_path, loss)
 
@@ -515,6 +522,7 @@ def train(
     loader: DataLoader,
     args: argparse.Namespace,
     is_main: bool = True,
+    resume_dir: Path | None = None,
 ) -> None:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -539,6 +547,10 @@ def train(
         optimizer = torch.optim.AdamW(
             trainable_params, lr=args.lr, weight_decay=0.1, betas=(0.9, 0.95)
         )
+
+    # Restore optimizer state if resuming from a step_*.pt checkpoint
+    if resume_dir is not None:
+        _load_resume(model, resume_dir, device, optimizer=optimizer)
 
     opt_step = 0
     micro_step = 0
@@ -620,15 +632,11 @@ def train(
             t0 = time.time()
 
         if opt_step % args.save_steps == 0 and is_main:
-            # 周期性 checkpoint：只保存 memory + lora，不存 optimizer（节省磁盘）
-            save_checkpoint(model, optimizer, opt_step, step_loss, output_dir,
-                            save_optimizer=False)
+            save_checkpoint(model, optimizer, opt_step, step_loss, output_dir)
 
     log.info("Training done at step %d (last loss=%.4f)", opt_step, step_loss)
     if is_main:
-        # 最终 checkpoint：保存 optimizer state 以支持精确 resume
-        save_checkpoint(model, optimizer, opt_step, step_loss, output_dir,
-                        save_optimizer=True)
+        save_checkpoint(model, optimizer, opt_step, step_loss, output_dir)
         model.save_pretrained(str(output_dir / "final"))
         log.info("Saved peft model → %s/final", output_dir)
 
@@ -758,8 +766,9 @@ def main() -> None:
     # Model
     model, trainable_params = build_model(args, tokenizer)
 
-    # Train
-    train(model, trainable_params, loader, args, is_main=is_main)
+    # Train (pass resume_dir so optimizer state can be restored after optimizer is created)
+    resume_dir = Path(args.resume) if args.resume else None
+    train(model, trainable_params, loader, args, is_main=is_main, resume_dir=resume_dir)
 
 
 if __name__ == "__main__":

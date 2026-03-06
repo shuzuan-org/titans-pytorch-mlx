@@ -442,28 +442,12 @@ class NeuralLongTermMemory(nn.Module):
         # Update memory with new key-value pairs
         grads = self._compute_gradients(k, v)
 
-        # CUDA kernel requires scalar gates; (D,) per-dim gates must use the
-        # standard path which handles broadcasting via _broadcast_gate().
-        # Passing (D,) to the kernel could silently produce wrong shapes.
-        gates_are_scalar = (
-            not isinstance(alpha_s, torch.Tensor) or alpha_s.dim() == 0
+        # Per-dim (D,) gates require _broadcast_gate() for correct shape handling.
+        # batched_memory_update (CUDA kernel) is designed for scalar gates only and
+        # is incompatible with (D,) tensors — use _standard_memory_update always.
+        new_weights, new_momentum = self._standard_memory_update(
+            state.weights, state.momentum, grads, alpha_s, eta_s, theta_s
         )
-        if HAS_CUDA_OPTIMIZATIONS and k.is_cuda and gates_are_scalar:
-            try:
-                new_weights, new_momentum = batched_memory_update(
-                    state.weights, state.momentum, grads, alpha_s, eta_s, theta_s
-                )
-            except Exception as e:
-                logger.debug(
-                    "CUDA batched memory update failed (%s), falling back to standard", e
-                )
-                new_weights, new_momentum = self._standard_memory_update(
-                    state.weights, state.momentum, grads, alpha_s, eta_s, theta_s
-                )
-        else:
-            new_weights, new_momentum = self._standard_memory_update(
-                state.weights, state.momentum, grads, alpha_s, eta_s, theta_s
-            )
 
         # Output projection
         output = self.proj_out(retrieved)

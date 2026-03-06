@@ -203,6 +203,35 @@ TOPICS_LIFE_EN = [
 
 ALL_TOPICS_EN = TOPICS_PERSONAL_EN + TOPICS_WORK_EN + TOPICS_LIFE_EN  # 40 topics
 
+# ---------------------------------------------------------------------------
+# 多语言支持：统一使用 EN 模板，在 system prompt 里指定目标语言
+# 训练时统一用 [WRITE]/[QUERY]/[MEMORY] markers（EN markers），内容可以是任意语言
+# ---------------------------------------------------------------------------
+
+# 支持的语言列表（lang_code → 语言名）
+SUPPORTED_LANGS: dict[str, str] = {
+    "zh": "Simplified Chinese",
+    "en": "English",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "fr": "French",
+    "es": "Spanish",
+    "de": "German",
+    "ar": "Arabic",
+    "ru": "Russian",
+    "pt": "Portuguese",
+    "it": "Italian",
+    "vi": "Vietnamese",
+}
+
+# 非 zh/en 语言的语言约束追加到 system prompt
+_LANG_INSTRUCTION = (
+    "\n\nLanguage requirement: ALL content in the JSON output "
+    "(writes/sessions, query, target_memory) MUST be written in {lang_name}. "
+    "Do NOT use English for any conversation content — only use English for "
+    "JSON field names and structural keywords."
+)
+
 TIME_SPANS_EN = [
     ("within a week", 2),
     ("over a month", 3),
@@ -570,7 +599,13 @@ _ASSISTANT_REPLY_STARTS_EN = (
 _ASSISTANT_REPLY_WORDS_EN = ("you should", "you need to", "I recommend that you")
 
 
-def _validate_sample(sample: dict, lang: str = "zh") -> tuple[bool, str]:
+# Stage 1: 单轮对话，target 是单条记忆摘要，短。
+# Stage 2: 多 session 积累，target 合并多条记忆，最长。
+# Stage 3: 实体更新精调，target 描述"变更后的新事实"，比 stage2 精简。
+_TARGET_MAX_LEN = {1: 300, 2: 800, 3: 600}
+
+
+def _validate_sample(sample: dict, lang: str = "zh", stage: int = 1) -> tuple[bool, str]:
     """基本质量检查，返回 (is_valid, reason)。"""
     h = sample.get("history", [])
     q = sample.get("query", "")
@@ -582,8 +617,9 @@ def _validate_sample(sample: dict, lang: str = "zh") -> tuple[bool, str]:
         return False, "query too short"
     if len(t) < 10:
         return False, "target too short"
-    if len(t) > 300:
-        return False, f"target too long: {len(t)}"
+    max_len = _TARGET_MAX_LEN.get(stage, 800)
+    if len(t) > max_len:
+        return False, f"target too long: {len(t)} > {max_len}"
 
     # importance 嵌在每个 turn dict 里
     imp = [turn.get("importance", 1) for turn in h]
@@ -592,9 +628,13 @@ def _validate_sample(sample: dict, lang: str = "zh") -> tuple[bool, str]:
     if sum(imp) == len(imp):
         return False, "no noise writes (model won't learn to filter)"
 
-    # target 不应该是助手回复风格
-    bad_starts = _ASSISTANT_REPLY_STARTS_EN if lang == "en" else _ASSISTANT_REPLY_STARTS_ZH
-    bad_words  = _ASSISTANT_REPLY_WORDS_EN  if lang == "en" else _ASSISTANT_REPLY_WORDS_ZH
+    # target 不应该是助手回复风格（只对 zh/en 做语言特定检查）
+    if lang == "en":
+        bad_starts, bad_words = _ASSISTANT_REPLY_STARTS_EN, _ASSISTANT_REPLY_WORDS_EN
+    elif lang == "zh":
+        bad_starts, bad_words = _ASSISTANT_REPLY_STARTS_ZH, _ASSISTANT_REPLY_WORDS_ZH
+    else:
+        bad_starts, bad_words = _ASSISTANT_REPLY_STARTS_EN, ()  # EN 格式兜底
     t_lower = t.lower()
     for bad_start in bad_starts:
         if t_lower.startswith(bad_start.lower()):
@@ -700,21 +740,20 @@ class OpenAIBackend:
 # ---------------------------------------------------------------------------
 
 
+def _get_system_prompt(lang: str) -> str:
+    """返回数据生成用的 system prompt（告知目标语言）。"""
+    if lang == "zh":
+        return SYSTEM_PROMPT
+    base = SYSTEM_PROMPT_EN
+    if lang != "en":
+        lang_name = SUPPORTED_LANGS.get(lang, lang)
+        base += _LANG_INSTRUCTION.format(lang_name=lang_name)
+    return base
+
+
 def _build_prompt(stage: int, lang: str = "zh") -> str:
-    if lang == "en":
-        topic = random.choice(ALL_TOPICS_EN)
-        if stage == 1:
-            return STAGE1_PROMPT_EN.format(topic=topic)
-        elif stage == 2:
-            span_label, n_sess = random.choice(TIME_SPANS_EN)
-            qtype = random.choice(QUERY_TYPES_EN)
-            return STAGE2_PROMPT_EN.format(
-                topic=topic, time_span=span_label,
-                n_sessions=n_sess, query_type=qtype,
-            )
-        else:
-            return STAGE3_PROMPT_EN.format(topic=topic)
-    else:
+    if lang == "zh":
+        # 中文：用中文 prompt 模板
         topic = random.choice(ALL_TOPICS)
         if stage == 1:
             return STAGE1_PROMPT.format(topic=topic)
@@ -727,6 +766,20 @@ def _build_prompt(stage: int, lang: str = "zh") -> str:
             )
         else:
             return STAGE3_PROMPT.format(topic=topic)
+    else:
+        # EN 及其他所有语言：用 EN prompt 模板（语言要求由 system prompt 指定）
+        topic = random.choice(ALL_TOPICS_EN)
+        if stage == 1:
+            return STAGE1_PROMPT_EN.format(topic=topic)
+        elif stage == 2:
+            span_label, n_sess = random.choice(TIME_SPANS_EN)
+            qtype = random.choice(QUERY_TYPES_EN)
+            return STAGE2_PROMPT_EN.format(
+                topic=topic, time_span=span_label,
+                n_sessions=n_sess, query_type=qtype,
+            )
+        else:
+            return STAGE3_PROMPT_EN.format(topic=topic)
 
 
 def _parse_and_convert(text: str, stage: int) -> dict | None:
@@ -774,22 +827,23 @@ def _generate_samples_concurrent(
     remaining = n_samples - already
     log.info("Concurrent [workers=%d]: need %d more.", concurrency, remaining)
 
-    sys_prompt = SYSTEM_PROMPT_EN if lang == "en" else SYSTEM_PROMPT
+    sys_prompt = _get_system_prompt(lang)
 
     def try_one() -> dict | None:
-        """一次 API 调用，返回有效样本或 None（解析失败/验证失败均返回 None）。"""
+        """一次 API 调用，最多 retry_limit 次。解析失败或 validate 失败均重试。"""
         prompt = _build_prompt(stage, lang)
         for retry in range(retry_limit):
             try:
                 raw = backend.generate(sys_prompt, prompt)
                 sample = _parse_and_convert(raw, stage)
-                if sample is not None:
-                    valid, reason = _validate_sample(sample, lang)
-                    if valid:
-                        return sample
-                    log.debug("Rejected: %s", reason)
-                    return None
-                log.debug("Parse failed (retry %d)", retry + 1)
+                if sample is None:
+                    log.debug("Parse failed (retry %d/%d)", retry + 1, retry_limit)
+                    continue
+                valid, reason = _validate_sample(sample, lang, stage)
+                if valid:
+                    return sample
+                log.debug("Validate failed (retry %d/%d): %s", retry + 1, retry_limit, reason)
+                # validate 失败说明模型输出质量差，重新生成而不是直接放弃
             except Exception as e:
                 wait = min(2 ** retry, 30)
                 log.warning("API error (retry %d/%d): %s — wait %ds", retry + 1, retry_limit, e, wait)
@@ -883,7 +937,7 @@ def generate_samples(
                 break
 
             prompt = _build_prompt(stage, lang)
-            sys_prompt = SYSTEM_PROMPT_EN if lang == "en" else SYSTEM_PROMPT
+            sys_prompt = _get_system_prompt(lang)
             sample = None
 
             for retry in range(retry_limit):
@@ -902,7 +956,7 @@ def generate_samples(
                 consecutive_failures += 1
                 continue
 
-            valid, reason = _validate_sample(sample, lang)
+            valid, reason = _validate_sample(sample, lang, stage)
             if not valid:
                 rejected += 1
                 consecutive_failures += 1
@@ -930,8 +984,10 @@ def generate_samples(
 # ---------------------------------------------------------------------------
 
 
-def validate_file(path: Path, lang: str = "zh") -> None:
-    total = valid = noise_ratio_sum = 0.0
+def validate_file(path: Path, lang: str, stage: int) -> None:
+    total = 0
+    valid = 0
+    noise_ratio_sum = 0.0
     errors: dict[str, int] = {}
 
     with path.open(encoding="utf-8") as f:
@@ -946,7 +1002,7 @@ def validate_file(path: Path, lang: str = "zh") -> None:
                 errors["json_decode"] = errors.get("json_decode", 0) + 1
                 continue
 
-            ok, reason = _validate_sample(sample, lang=lang)
+            ok, reason = _validate_sample(sample, lang=lang, stage=stage)
             if ok:
                 valid += 1
                 imp = [t.get("importance", 1) for t in sample.get("history", [])]
@@ -956,8 +1012,8 @@ def validate_file(path: Path, lang: str = "zh") -> None:
                 errors[reason] = errors.get(reason, 0) + 1
 
     log.info("=== Validation: %s ===", path)
-    log.info("  Total:   %d", int(total))
-    log.info("  Valid:   %d (%.1f%%)", int(valid), 100.0 * valid / max(total, 1))
+    log.info("  Total:   %d", total)
+    log.info("  Valid:   %d (%.1f%%)", valid, 100.0 * valid / max(total, 1))
     log.info("  Avg noise ratio: %.1f%%", 100.0 * noise_ratio_sum / max(valid, 1))
     if errors:
         log.info("  Rejection reasons:")
@@ -988,8 +1044,8 @@ def parse_args() -> argparse.Namespace:
                    help="Concurrent API calls (>1 uses thread pool, recommended for API backend)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--lang", default="zh", choices=["zh", "en"],
-                   help="Generation language: zh=Chinese (default), en=English")
+    p.add_argument("--lang", default="zh", choices=sorted(SUPPORTED_LANGS.keys()),
+                   help="Content language (default: zh). Markers are always [WRITE]/[QUERY]/[MEMORY].")
     p.add_argument("--validate", action="store_true",
                    help="Validate existing output file instead of generating")
     return p.parse_args()
@@ -1005,7 +1061,7 @@ def main() -> None:
         if not output_path.exists():
             log.error("File not found: %s", output_path)
             sys.exit(1)
-        validate_file(output_path)
+        validate_file(output_path, lang=args.lang, stage=args.stage)
         return
 
     if args.backend == "local":

@@ -493,6 +493,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--judge-base-url", default=None,
                    help="Custom base URL for judge OpenAI client")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--shard", type=int, default=0,
+                   help="当前 shard 索引（0-based），用于多 GPU 并行评测")
+    p.add_argument("--total-shards", type=int, default=1,
+                   help="总 shard 数，用于多 GPU 并行评测")
     return p.parse_args()
 
 
@@ -503,6 +507,11 @@ def main() -> None:
     raw_data = load_locomo(args.data)
     qa_pairs = flatten_qa_pairs(raw_data)
     log.info("LOCOMO: %d QA pairs total", len(qa_pairs))
+
+    # 按 shard 分片（多 GPU 并行时每个进程只处理自己的分片）
+    if args.total_shards > 1:
+        qa_pairs = qa_pairs[args.shard::args.total_shards]
+        log.info("Shard %d/%d: %d QA pairs", args.shard, args.total_shards, len(qa_pairs))
 
     # 评分器
     judge: LLMJudge | None = None

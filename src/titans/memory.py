@@ -22,12 +22,15 @@ where:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+
+logger = logging.getLogger(__name__)
 
 from titans.config import TitansConfig
 
@@ -316,8 +319,10 @@ class NeuralLongTermMemory(nn.Module):
                     weights,
                     activation=self.config.activation,
                 )
-            except Exception:
-                pass  # Fall back to standard method
+            except Exception as e:
+                logger.debug(
+                    "CUDA gradient optimization failed (%s), falling back to autograd", e
+                )
 
         # Use torch.enable_grad() to compute gradients even in inference mode
         # This is essential because Titans learns at test time
@@ -427,10 +432,12 @@ class NeuralLongTermMemory(nn.Module):
         theta = self.gate_lr(x) * self.config.memory_lr        # per-token lr
         eta = self.gate_momentum(x) * self.config.memory_momentum  # per-token momentum
 
-        # Aggregate to scalars for weight update (mean over batch+seq+dim)
-        alpha_s = alpha.mean()
-        theta_s = theta.mean()
-        eta_s = eta.mean()
+        # Aggregate over batch+seq, keep dim → (D,) per-output-dim gates.
+        # This preserves per-feature decay/lr/momentum as the paper specifies,
+        # rather than collapsing everything to a single scalar.
+        alpha_s = alpha.mean(dim=(0, 1))   # (batch, seq, D) → (D,)
+        theta_s = theta.mean(dim=(0, 1))
+        eta_s = eta.mean(dim=(0, 1))
 
         # Update memory with new key-value pairs
         grads = self._compute_gradients(k, v)
@@ -440,7 +447,10 @@ class NeuralLongTermMemory(nn.Module):
                 new_weights, new_momentum = batched_memory_update(
                     state.weights, state.momentum, grads, alpha_s, eta_s, theta_s
                 )
-            except Exception:
+            except Exception as e:
+                logger.debug(
+                    "CUDA batched memory update failed (%s), falling back to standard", e
+                )
                 new_weights, new_momentum = self._standard_memory_update(
                     state.weights, state.momentum, grads, alpha_s, eta_s, theta_s
                 )
@@ -459,6 +469,31 @@ class NeuralLongTermMemory(nn.Module):
             return output, new_state.detach()
         return output, None
 
+    @staticmethod
+    def _broadcast_gate(
+        gate: torch.Tensor | float, w: torch.Tensor
+    ) -> torch.Tensor | float:
+        """Reshape a (D,) per-dim gate for broadcasting with weight matrix w.
+
+        Weight matrices have shape (D_out, D_in).  A (D,) gate should scale
+        per output-dimension (rows), so we unsqueeze to (D_out, 1) which
+        broadcasts correctly against (D_out, D_in).
+
+        Falls back to a scalar mean when shapes don't align (e.g. intermediate
+        layers in deep memory where D_out == hidden_dim != D).
+        """
+        if not isinstance(gate, torch.Tensor) or gate.dim() == 0:
+            return gate
+        if gate.shape[0] == w.shape[0]:
+            return gate.unsqueeze(-1)  # (D,) → (D, 1) for row-wise scaling
+        # Shape mismatch (deep memory hidden layers: D_out == hidden_dim != D)
+        # Fall back to scalar to avoid incorrect broadcasting.
+        logger.debug(
+            "_broadcast_gate: shape mismatch gate=%s w=%s, falling back to scalar mean",
+            gate.shape, w.shape,
+        )
+        return gate.mean()
+
     def _standard_memory_update(
         self,
         weights: list[torch.Tensor],
@@ -474,9 +509,9 @@ class NeuralLongTermMemory(nn.Module):
             weights: Current weight tensors
             momentum: Current momentum tensors
             grads: Gradient tensors
-            alpha: Decay factor
-            eta: Momentum coefficient
-            theta: Learning rate
+            alpha: Decay factor — scalar or (D,) per-output-dim tensor
+            eta: Momentum coefficient — scalar or (D,) per-output-dim tensor
+            theta: Learning rate — scalar or (D,) per-output-dim tensor
 
         Returns:
             Tuple of (new_weights, new_momentum)
@@ -484,13 +519,16 @@ class NeuralLongTermMemory(nn.Module):
         # Update momentum: S_t = eta * S_{t-1} - theta * grad
         new_momentum = []
         for m, g in zip(momentum, grads, strict=True):
-            s = eta * m - theta * g
+            _eta = self._broadcast_gate(eta, m)
+            _theta = self._broadcast_gate(theta, g)
+            s = _eta * m - _theta * g
             new_momentum.append(s)
 
         # Update weights: M_t = (1 - alpha) * M_{t-1} + S_t
         new_weights = []
         for w, s in zip(weights, new_momentum, strict=True):
-            w_new = (1 - alpha) * w + s
+            _alpha = self._broadcast_gate(alpha, w)
+            w_new = (1 - _alpha) * w + s
             new_weights.append(w_new)
 
         return new_weights, new_momentum

@@ -199,7 +199,7 @@ TOPICS_LIFE_EN = [
     "retirement planning and next chapter",
 ]
 
-ALL_TOPICS_EN = TOPICS_PERSONAL_EN + TOPICS_WORK_EN + TOPICS_LIFE_EN
+ALL_TOPICS_EN = TOPICS_PERSONAL_EN + TOPICS_WORK_EN + TOPICS_LIFE_EN  # 40 topics
 
 TIME_SPANS_EN = [
     ("within a week", 2),
@@ -618,7 +618,7 @@ class LocalBackend:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map={"": device},
             trust_remote_code=True,
         )
@@ -825,7 +825,7 @@ def generate_samples(
 # ---------------------------------------------------------------------------
 
 
-def validate_file(path: Path) -> None:
+def validate_file(path: Path, lang: str = "zh") -> None:
     total = valid = noise_ratio_sum = 0.0
     errors: dict[str, int] = {}
 
@@ -841,7 +841,7 @@ def validate_file(path: Path) -> None:
                 errors["json_decode"] = errors.get("json_decode", 0) + 1
                 continue
 
-            ok, reason = _validate_sample(sample)
+            ok, reason = _validate_sample(sample, lang=lang)
             if ok:
                 valid += 1
                 imp = [t.get("importance", 1) for t in sample.get("history", [])]
@@ -917,7 +917,7 @@ def main() -> None:
              count, rejected, 100.0 * rejected / max(count + rejected, 1))
 
     # 自动验证
-    validate_file(output_path)
+    validate_file(output_path, lang=args.lang)
 
 
 if __name__ == "__main__":

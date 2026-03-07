@@ -52,17 +52,16 @@ bias_count=$(awk '/^## 项目特有偏差/{found=1; next} /^## /{found=0} found 
 echo "   共 $bias_count 条"
 
 # 5. 导航链接检查
-# 提取两种格式：[text](path) 和 → **path** 或 → path
+# 格式约定：导航块全部使用 [label](path)
+#   - L1 私有文件以 memory/ 开头 → 解析到 $MEMORY_DIR/
+#   - 其余路径 → 解析到 $PROJECT_ROOT/
 echo ""
 echo "🔗 导航链接:"
 broken=0
 while IFS= read -r link; do
     [ -z "$link" ] && continue
-    # 解析路径：decisions.md / bottlenecks.md 在 MEMORY_DIR，其余在 PROJECT_ROOT
-    if [[ "$link" == decisions.md || "$link" == bottlenecks.md ]]; then
-        check_path="$MEMORY_DIR/$link"
-    elif [[ "$link" == /* ]]; then
-        check_path="$link"
+    if [[ "$link" == memory/* ]]; then
+        check_path="$MEMORY_DIR/${link#memory/}"
     else
         check_path="$PROJECT_ROOT/$link"
     fi
@@ -74,8 +73,7 @@ while IFS= read -r link; do
     fi
 done < <(
     awk '/^## 导航/{found=1; next} /^## /{found=0} found' "$MEMORY" | \
-    grep -oP '(?<=\]\()[^)]+|(?<=→ \*\*)[^*]+(?=\*\*)|(?<=→ )[a-zA-Z0-9_./-]+(?=（|$| )' | \
-    grep -v '^$' || true
+    grep -oP '(?<=\]\()[^)]+' | grep -v '^$' || true
 )
 [ "$broken" -eq 0 ] && echo "   全部有效"
 

@@ -3,11 +3,12 @@
 # Licensed under the Apache License, Version 2.0
 
 """
-多语言混合训练流水线。
+多语言混合训练流水线（自包含）。
 
 功能：
-  1. 轮询等待各语言各阶段数据就绪（达到目标量的 90%）
+  1. 按需生成各语言各阶段训练数据（不足则自动启动 build_memory_data_v2.py）
   2. 用 torchrun 启动加权混合三阶段训练
+  3. Stage 3 完成后自动运行 LoCoMo 评测
 
 用法：
     nohup python scripts/train_multilang.py > logs/train_multilang.log 2>&1 &
@@ -148,6 +149,110 @@ def wait_for_data(
         time.sleep(poll_sec)
 
 
+def generate_stage_data(
+    stage: int,
+    data_root: Path,
+    langs: list[str],
+    args: argparse.Namespace,
+) -> None:
+    """为指定 stage 的所有语言生成训练数据（缺少的部分）。
+
+    对每种语言计算还需生成多少条，启动若干 worker（写到 part 文件），
+    全部完成后合并到 stage{N}.jsonl。已满足 READY_RATIO 的语言直接跳过。
+    """
+    import math
+
+    gpus = args.gpus.split(",")
+    n_gpus = len(gpus)
+    spw = args.samples_per_worker   # 每个 worker 生成的样本数
+
+    # 先统计哪些语言需要生成
+    tasks: list[tuple[str, int]] = []  # (lang, n_to_generate)
+    for lang in langs:
+        path = data_root / f"memory_{lang}" / f"stage{stage}.jsonl"
+        existing = count_lines(path)
+        target = TARGETS[lang][stage - 1]
+        if existing >= target * READY_RATIO:
+            log.info("  %s stage%d: 已有 %d/%d，跳过生成", lang, stage, existing, target)
+            continue
+        needed = target - existing
+        # 多生成 15% 以防 validation 过滤导致不足
+        tasks.append((lang, math.ceil(needed * 1.15)))
+
+    if not tasks:
+        log.info("Stage %d 所有语言数据已就绪，跳过生成", stage)
+        return
+
+    log.info("=== Stage %d 数据生成（%d 种语言需补充）===", stage, len(tasks))
+
+    procs: list[tuple[subprocess.Popen, Path, str]] = []  # (proc, part_path, lang)
+    gpu_cursor = 0
+
+    for lang, n_total in tasks:
+        out_dir = data_root / f"memory_{lang}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        n_workers = max(1, math.ceil(n_total / spw))
+        per_worker = math.ceil(n_total / n_workers)
+        log.info("  %s: 补充 %d 条 → %d workers × %d samples", lang, n_total, n_workers, per_worker)
+
+        for i in range(n_workers):
+            gpu = gpus[gpu_cursor % n_gpus]
+            gpu_cursor += 1
+            part_path = out_dir / f"stage{stage}_gen{i}.jsonl"
+            log_path = Path(args.log_dir) / f"build_{lang}_s{stage}_w{i}.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                args.python,
+                args.build_script,
+                "--stage", str(stage),
+                "--lang", lang,
+                "--n-samples", str(per_worker),
+                "--output", str(part_path),
+                "--backend", "local",
+                "--model", args.model,
+                "--device", f"cuda:{gpu}",
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=open(log_path, "w"),
+                stderr=subprocess.STDOUT,
+            )
+            procs.append((proc, part_path, lang))
+
+    log.info("共启动 %d 个生成进程（%d GPU 轮询），等待完成...", len(procs), n_gpus)
+
+    failed_parts: list[Path] = []
+    for proc, part_path, lang in procs:
+        ret = proc.wait()
+        if ret != 0:
+            log.warning("生成进程失败 (exit=%d): %s", ret, part_path)
+            failed_parts.append(part_path)
+
+    if failed_parts:
+        log.warning("%d 个进程失败，继续合并已完成部分", len(failed_parts))
+
+    # 合并 part 文件 → stage{N}.jsonl
+    log.info("=== 合并 Stage %d 数据 ===", stage)
+    for lang in langs:
+        out_dir = data_root / f"memory_{lang}"
+        main_file = out_dir / f"stage{stage}.jsonl"
+        parts = sorted(out_dir.glob(f"stage{stage}_gen*.jsonl"))
+        if not parts:
+            continue
+        with main_file.open("a") as f_out:
+            for part in parts:
+                try:
+                    f_out.write(part.read_text(encoding="utf-8"))
+                    part.unlink()
+                except Exception as e:
+                    log.warning("合并 %s 失败: %s", part, e)
+        count = count_lines(main_file)
+        target = TARGETS[lang][stage - 1]
+        log.info("  %s: %d / %d %s", lang, count, target,
+                 "✓" if count >= target * READY_RATIO else "⚠ 不足")
+
+
 def build_data_args(data_root: Path, stage: int, langs: list[str]) -> list[str]:
     """生成 --data file1 file2 ... --data-weights w1 w2 ... 参数列表。"""
     data_args: list[str] = ["--data"]
@@ -284,6 +389,17 @@ def parse_args() -> argparse.Namespace:
                    default="/home/shuzuan/miniconda3/envs/sglang/bin/torchrun")
     p.add_argument("--train-script",
                    default=str(base / "scripts" / "train_memory_oracle.py"))
+    # 数据生成参数
+    p.add_argument("--build-script",
+                   default=str(base / "scripts" / "build_memory_data_v2.py"),
+                   help="数据生成脚本路径")
+    p.add_argument("--python",
+                   default=sys.executable,
+                   help="Python 解释器路径（默认与当前进程相同）")
+    p.add_argument("--samples-per-worker", type=int, default=1000,
+                   help="每个生成 worker 的目标样本数（影响并发数）")
+    p.add_argument("--no-generate", action="store_true",
+                   help="跳过数据生成，直接等待（兼容旧行为：外部手动生成数据）")
     # 评测参数（stage3 完成后自动运行 LoCoMo 评测）
     p.add_argument("--no-eval",      action="store_true",
                    help="跳过训练后评测")
@@ -317,15 +433,23 @@ def main() -> None:
     log.info("Checkpoint: %s", ckpt_root)
 
     for stage in sorted(args.stages):
-        # 等待该阶段数据就绪（最长停滞 2 小时无进展则 abort）
-        wait_for_data(data_root, stage, langs, poll_sec=args.poll_sec, max_stall_sec=7200)
+        # 数据准备：自动生成（默认）或外部等待（--no-generate）
+        if args.no_generate:
+            wait_for_data(data_root, stage, langs, poll_sec=args.poll_sec, max_stall_sec=7200)
+        else:
+            generate_stage_data(stage, data_root, langs, args)
 
         # 打印就绪后的汇总
-        _, counts = data_ready(data_root, stage, langs)
+        ready, counts = data_ready(data_root, stage, langs)
         total = sum(counts.values())
         log.info("Stage %d 数据汇总: total=%d  %s",
                  stage, total,
                  "  ".join(f"{l}={counts[l]}" for l in langs))
+        if not ready:
+            raise RuntimeError(
+                f"Stage {stage} 数据生成后仍不足，请检查 build_script 日志。"
+                f"当前: { {l: counts[l] for l in langs if counts[l] < TARGETS[l][stage-1] * READY_RATIO} }"
+            )
 
         # 启动训练
         run_stage(stage, data_root, ckpt_root, langs, args)

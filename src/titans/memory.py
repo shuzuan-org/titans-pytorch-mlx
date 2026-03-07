@@ -43,24 +43,16 @@ try:
 except ImportError:
     HAS_CUDA_OPTIMIZATIONS = False
 
-# Check for Triton availability
-try:
-    from titans.triton_kernels import triton_memory_update, is_triton_available
-    HAS_TRITON = is_triton_available()
-except ImportError:
-    HAS_TRITON = False
-
 
 def get_activation(name: str) -> nn.Module:
     """Get activation function by name."""
-    activations = {
-        "silu": nn.SiLU(),
-        "gelu": nn.GELU(),
-        "relu": nn.ReLU(),
-    }
-    if name not in activations:
-        raise ValueError(f"Unknown activation: {name}")
-    return activations[name]
+    if name == "silu":
+        return nn.SiLU()
+    if name == "gelu":
+        return nn.GELU()
+    if name == "relu":
+        return nn.ReLU()
+    raise ValueError(f"Unknown activation: {name}")
 
 
 @dataclass
@@ -297,9 +289,8 @@ class NeuralLongTermMemory(nn.Module):
         with respect to the memory weights.
 
         Uses optimized gradient computation when available:
-        - Analytical gradients for single-layer memory
-        - Triton kernels for fused operations
-        - Fallback to autograd for complex cases
+        - Analytical gradients for single-layer memory (CUDA)
+        - Fallback to autograd
 
         Args:
             keys: Key vectors (batch, seq, dim)
@@ -330,8 +321,8 @@ class NeuralLongTermMemory(nn.Module):
                 for param in self.memory.parameters():
                     param.requires_grad_(True)
                 keys_grad = keys.detach().requires_grad_(True)
-                values_grad = values.detach()
-                loss = self.memory.compute_loss(keys_grad, values_grad)
+                v = values.detach()
+                loss = self.memory.compute_loss(keys_grad, v)
                 grads = torch.autograd.grad(
                     loss,
                     list(self.memory.parameters()),
@@ -390,7 +381,7 @@ class NeuralLongTermMemory(nn.Module):
         Returns:
             Tuple of (output, state) where output is (batch, seq, dim)
         """
-        batch_size, seq_len, _ = x.shape
+        batch_size = x.shape[0]
         device = x.device
 
         # Initialize state if needed

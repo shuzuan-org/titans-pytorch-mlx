@@ -327,9 +327,9 @@ class NeuralLongTermMemory(nn.Module):
         # Use torch.enable_grad() to compute gradients even in inference mode
         # This is essential because Titans learns at test time
         with torch.enable_grad():
-            for param in self.memory.parameters():
-                param.requires_grad_(True)
             try:
+                for param in self.memory.parameters():
+                    param.requires_grad_(True)
                 keys_grad = keys.detach().requires_grad_(True)
                 values_grad = values.detach()
                 loss = self.memory.compute_loss(keys_grad, values_grad)
@@ -428,20 +428,20 @@ class NeuralLongTermMemory(nn.Module):
         eta = self.gate_momentum(x) * self.config.memory_momentum  # per-token momentum
 
         # Aggregate over batch+seq, keep dim → (D,) per-output-dim gates.
-        # This preserves per-feature decay/lr/momentum as the paper specifies,
-        # rather than collapsing everything to a single scalar.
-        alpha_s = alpha.mean(dim=(0, 1))   # (batch, seq, D) → (D,)
-        theta_s = theta.mean(dim=(0, 1))
-        eta_s = eta.mean(dim=(0, 1))
+        # Better than a single scalar, but still a token-averaged approximation
+        # of the paper's sequential per-token update (α_t, θ_t, η_t per token).
+        alpha_d = alpha.mean(dim=(0, 1))   # (batch, seq, D) → (D,)
+        theta_d = theta.mean(dim=(0, 1))
+        eta_d = eta.mean(dim=(0, 1))
 
         # Update memory with new key-value pairs
         grads = self._compute_gradients(k, v)
 
         # Per-dim (D,) gates require _broadcast_gate() for correct shape handling.
-        # batched_memory_update (CUDA kernel) is designed for scalar gates only and
-        # is incompatible with (D,) tensors — use _standard_memory_update always.
+        # TODO: update batched_memory_update kernel to support (D,) per-dim gates.
+        # Until then, always use _standard_memory_update.
         new_weights, new_momentum = self._standard_memory_update(
-            state.weights, state.momentum, grads, alpha_s, eta_s, theta_s
+            state.weights, state.momentum, grads, alpha_d, eta_d, theta_d
         )
 
         # Output projection

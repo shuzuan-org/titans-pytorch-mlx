@@ -132,8 +132,8 @@ class LLMJudge:
 
 def f1_score(prediction: str, reference: str) -> float:
     """Token-level F1（简单空格分词）。"""
-    pred_tokens = set(prediction.lower().split())
-    ref_tokens = set(reference.lower().split())
+    pred_tokens = set(str(prediction).lower().split())
+    ref_tokens = set(str(reference).lower().split())
     if not pred_tokens or not ref_tokens:
         return 0.0
     common = pred_tokens & ref_tokens
@@ -395,12 +395,16 @@ def _generate_answer(
     max_new_tokens: int = 100,
 ) -> str:
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    # bad_words: 248068 = Qwen3.5 <think> token，不压制会生成空 think block 或中文重复循环
+    think_id = tokenizer.convert_tokens_to_ids("<think>")
+    bad_words = [[think_id]] if think_id and think_id != tokenizer.unk_token_id else []
     output = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
-        temperature=0.1,
         do_sample=False,
         pad_token_id=tokenizer.eos_token_id,
+        bad_words_ids=bad_words if bad_words else None,
+        repetition_penalty=1.3,
     )
     new_tokens = output[0, inputs["input_ids"].shape[1]:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
@@ -534,13 +538,15 @@ def main() -> None:
 
     # 加载 LOCOMO
     raw_data = load_locomo(args.data)
-    qa_pairs = flatten_qa_pairs(raw_data)
-    log.info("LOCOMO: %d QA pairs total", len(qa_pairs))
 
-    # 按 shard 分片（多 GPU 并行时每个进程只处理自己的分片）
+    # 按 conversation 分片（比按 QA pair 分片快得多）：
+    # 每个 shard 只 write 自己负责的对话，而不是 write 全部对话只答一部分题
     if args.total_shards > 1:
-        qa_pairs = qa_pairs[args.shard::args.total_shards]
-        log.info("Shard %d/%d: %d QA pairs", args.shard, args.total_shards, len(qa_pairs))
+        raw_data = raw_data[args.shard::args.total_shards]
+        log.info("Shard %d/%d: %d conversations", args.shard, args.total_shards, len(raw_data))
+
+    qa_pairs = flatten_qa_pairs(raw_data)
+    log.info("LOCOMO: %d QA pairs in this shard", len(qa_pairs))
 
     # 评分器
     judge: LLMJudge | None = None

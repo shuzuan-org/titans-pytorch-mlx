@@ -259,8 +259,9 @@ def get_trainable_params(model: nn.Module) -> list[nn.Parameter]:
     for param in model.parameters():
         param.requires_grad_(False)
 
-    # Step 2: unfreeze NLM structural params by direct access (avoids id()
-    # cross-referencing which breaks when peft re-creates parameter objects)
+    # Step 2: unfreeze NLM structural params by direct access.
+    # Cleaner than collecting id()s in one loop and cross-referencing in
+    # another — mutate the param object the moment we find it.
     for module in model.modules():
         if isinstance(module, Qwen35LayerWithMemory):
             for name, param in module.memory.named_parameters():

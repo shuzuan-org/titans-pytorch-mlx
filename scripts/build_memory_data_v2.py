@@ -1065,6 +1065,16 @@ def main() -> None:
         return
 
     if args.backend == "local":
+        if args.stage >= 2:
+            log.error(
+                "Stage %d 禁止使用 --backend local。"
+                "0.8B 模型质量不足以生成 Stage 2/3 复杂多 session 训练数据，"
+                "且速度极慢（约 0.8 条/min/worker vs API 的 40+ 条/min）。"
+                "请改用 --backend openai --openai-model MiniMax-Text-01 "
+                "--openai-base-url https://mini.origintask.cn/v1 --concurrency 10",
+                args.stage,
+            )
+            sys.exit(1)
         backend = LocalBackend(args.model, args.device)
     else:
         backend = OpenAIBackend(args.openai_model, args.openai_base_url, args.openai_api_key)

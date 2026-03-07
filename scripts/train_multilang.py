@@ -157,14 +157,17 @@ def generate_stage_data(
 ) -> None:
     """为指定 stage 的所有语言生成训练数据（缺少的部分）。
 
-    对每种语言计算还需生成多少条，启动若干 worker（写到 part 文件），
-    全部完成后合并到 stage{N}.jsonl。已满足 READY_RATIO 的语言直接跳过。
+    - Stage 1：local backend，按 GPU 分配 worker
+    - Stage 2/3：API backend（MiniMax），高并发，不占 GPU
+    已满足 READY_RATIO 的语言直接跳过。
     """
     import math
 
+    # 决定本 stage 使用哪种 backend
+    use_api = (args.gen_backend == "api") or (args.gen_backend == "auto" and stage >= 2)
+
     gpus = args.gpus.split(",")
     n_gpus = len(gpus)
-    spw = args.samples_per_worker   # 每个 worker 生成的样本数
 
     # 先统计哪些语言需要生成
     tasks: list[tuple[str, int]] = []  # (lang, n_to_generate)
@@ -176,14 +179,15 @@ def generate_stage_data(
             log.info("  %s stage%d: 已有 %d/%d，跳过生成", lang, stage, existing, target)
             continue
         needed = target - existing
-        # 多生成 15% 以防 validation 过滤导致不足
-        tasks.append((lang, math.ceil(needed * 1.15)))
+        tasks.append((lang, math.ceil(needed * 1.15)))  # 多 15% 防 validation 过滤
 
     if not tasks:
         log.info("Stage %d 所有语言数据已就绪，跳过生成", stage)
         return
 
-    log.info("=== Stage %d 数据生成（%d 种语言需补充）===", stage, len(tasks))
+    backend_label = "api(MiniMax)" if use_api else "local(0.8B)"
+    log.info("=== Stage %d 数据生成（%d 种语言，backend=%s）===",
+             stage, len(tasks), backend_label)
 
     procs: list[tuple[subprocess.Popen, Path, str]] = []  # (proc, part_path, lang)
     gpu_cursor = 0
@@ -191,36 +195,64 @@ def generate_stage_data(
     for lang, n_total in tasks:
         out_dir = data_root / f"memory_{lang}"
         out_dir.mkdir(parents=True, exist_ok=True)
-        n_workers = max(1, math.ceil(n_total / spw))
-        per_worker = math.ceil(n_total / n_workers)
-        log.info("  %s: 补充 %d 条 → %d workers × %d samples", lang, n_total, n_workers, per_worker)
 
-        for i in range(n_workers):
-            gpu = gpus[gpu_cursor % n_gpus]
-            gpu_cursor += 1
-            part_path = out_dir / f"stage{stage}_gen{i}.jsonl"
-            log_path = Path(args.log_dir) / f"build_{lang}_s{stage}_w{i}.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
+        # 清理残留 part 文件，避免重试时数据重复计入
+        for stale in out_dir.glob(f"stage{stage}_gen*.jsonl"):
+            stale.unlink()
+            log.info("  清理残留 part: %s", stale.name)
 
-            cmd = [
-                args.python,
-                args.build_script,
-                "--stage", str(stage),
-                "--lang", lang,
-                "--n-samples", str(per_worker),
-                "--output", str(part_path),
-                "--backend", "local",
-                "--model", args.model,
-                "--device", f"cuda:{gpu}",
-            ]
-            proc = subprocess.Popen(
-                cmd,
-                stdout=open(log_path, "w"),
-                stderr=subprocess.STDOUT,
-            )
-            procs.append((proc, part_path, lang))
+        if use_api:
+            n_workers = args.gen_api_workers
+            per_worker = math.ceil(n_total / n_workers)
+            log.info("  %s: 补充 %d 条 → %d workers × %d samples (concurrency=%d/worker)",
+                     lang, n_total, n_workers, per_worker, args.gen_concurrency)
+            for i in range(n_workers):
+                part_path = out_dir / f"stage{stage}_gen{i}.jsonl"
+                log_path = Path(args.log_dir) / f"build_{lang}_s{stage}_w{i}.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                cmd = [
+                    args.python, args.build_script,
+                    "--stage", str(stage),
+                    "--lang", lang,
+                    "--n-samples", str(per_worker),
+                    "--output", str(part_path),
+                    "--backend", "openai",
+                    "--openai-model", args.gen_model,
+                    "--openai-base-url", args.gen_base_url,
+                    "--openai-api-key", args.gen_api_key,
+                    "--concurrency", str(args.gen_concurrency),
+                ]
+                log_file = open(log_path, "w")
+                proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+                log_file.close()  # fork 后子进程持有 fd 副本，父进程安全关闭
+                procs.append((proc, part_path, lang))
+        else:
+            n_workers = max(1, math.ceil(n_total / args.samples_per_worker))
+            per_worker = math.ceil(n_total / n_workers)
+            log.info("  %s: 补充 %d 条 → %d workers × %d samples (GPU 轮询)",
+                     lang, n_total, n_workers, per_worker)
+            for i in range(n_workers):
+                gpu = gpus[gpu_cursor % n_gpus]
+                gpu_cursor += 1
+                part_path = out_dir / f"stage{stage}_gen{i}.jsonl"
+                log_path = Path(args.log_dir) / f"build_{lang}_s{stage}_w{i}.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                cmd = [
+                    args.python, args.build_script,
+                    "--stage", str(stage),
+                    "--lang", lang,
+                    "--n-samples", str(per_worker),
+                    "--output", str(part_path),
+                    "--backend", "local",
+                    "--model", args.model,
+                    "--device", f"cuda:{gpu}",
+                ]
+                log_file = open(log_path, "w")
+                proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+                log_file.close()
+                procs.append((proc, part_path, lang))
 
-    log.info("共启动 %d 个生成进程（%d GPU 轮询），等待完成...", len(procs), n_gpus)
+    log.info("共启动 %d 个生成进程，等待完成...", len(procs))
 
     failed_parts: list[Path] = []
     for proc, part_path, lang in procs:
@@ -334,6 +366,7 @@ def run_stage(
                 sys.stdout.write(line)
                 sys.stdout.flush()
                 lf.write(line)
+                lf.flush()
         ret = proc.wait()
     except BaseException:
         # Ctrl+C、SIGTERM、日志文件打开失败等 — 确保 torchrun 及其 worker 都被终止
@@ -397,9 +430,23 @@ def parse_args() -> argparse.Namespace:
                    default=sys.executable,
                    help="Python 解释器路径（默认与当前进程相同）")
     p.add_argument("--samples-per-worker", type=int, default=1000,
-                   help="每个生成 worker 的目标样本数（影响并发数）")
+                   help="每个生成 worker 的目标样本数（影响并发数，local backend 有效）")
     p.add_argument("--no-generate", action="store_true",
                    help="跳过数据生成，直接等待（兼容旧行为：外部手动生成数据）")
+    # 生成 backend：stage1 用 local，stage2/3 必须用 api
+    p.add_argument("--gen-backend", choices=["local", "api", "auto"], default="auto",
+                   help="数据生成 backend：auto=stage1用local/stage2+用api")
+    p.add_argument("--gen-api-key",
+                   default=os.environ.get("OPENAI_API_KEY", "shuzuan2025-minimax"),
+                   help="API key（支持 MiniMax / OpenAI 兼容接口）")
+    p.add_argument("--gen-base-url", default="https://mini.origintask.cn/v1",
+                   help="API base URL")
+    p.add_argument("--gen-model", default="MiniMax-Text-01",
+                   help="API 生成模型名")
+    p.add_argument("--gen-concurrency", type=int, default=10,
+                   help="每个 worker 进程的并发 API 请求数")
+    p.add_argument("--gen-api-workers", type=int, default=3,
+                   help="api backend 下每种语言的 worker 进程数")
     # 评测参数（stage3 完成后自动运行 LoCoMo 评测）
     p.add_argument("--no-eval",      action="store_true",
                    help="跳过训练后评测")

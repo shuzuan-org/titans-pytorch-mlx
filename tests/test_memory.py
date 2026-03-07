@@ -179,17 +179,16 @@ class TestNeuralLongTermMemory:
         memory = NeuralLongTermMemory(default_config)
         x = torch.randn(batch_size, seq_len, default_config.dim)
 
-        output, state = memory(x, return_state=False)
+        output, state = memory(x, update_memory=False)
 
         assert output.shape == x.shape
         assert state is None
 
-    def test_init_state(self, default_config: TitansConfig, batch_size: int) -> None:
+    def test_init_state(self, default_config: TitansConfig) -> None:
         """Test memory state initialization."""
         memory = NeuralLongTermMemory(default_config)
-        device = torch.device("cpu")
 
-        state = memory.init_state(batch_size, device)
+        state = memory.init_state()
 
         assert len(state.weights) == default_config.num_memory_layers
         assert len(state.momentum) == default_config.num_memory_layers
@@ -206,7 +205,7 @@ class TestNeuralLongTermMemory:
         x = torch.randn(batch_size, seq_len, default_config.dim)
 
         # Get initial state
-        state = memory.init_state(batch_size, x.device)
+        state = memory.init_state()
 
         # Retrieve
         retrieved = memory.retrieve(x, state)

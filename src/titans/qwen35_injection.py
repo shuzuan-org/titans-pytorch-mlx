@@ -118,7 +118,7 @@ class Qwen35LayerWithMemory(nn.Module):
             mem_out, self.memory_state = self.memory(
                 hidden_states,
                 state=self.memory_state,
-                return_state=True,
+                update_memory=True,
             )
 
         hidden_states = hidden_states + mem_out

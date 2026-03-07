@@ -97,30 +97,30 @@ class MemoryMLP(nn.Module):
 
     def __init__(self, config: TitansConfig) -> None:
         super().__init__()
-        self.config = config
-        self.num_layers = config.num_memory_layers
-        self.dim = config.dim
-        self.hidden_dim = config.memory_hidden_dim
+        self.init_std = config.init_std
 
         # Build MLP layers
+        num_layers = config.num_memory_layers
+        dim = config.dim
+        hidden_dim = config.memory_hidden_dim
         self.layers = nn.ModuleList()
 
-        if self.num_layers == 1:
+        if num_layers == 1:
             # Linear memory: single linear layer
-            self.layers.append(nn.Linear(self.dim, self.dim, bias=False))
+            self.layers.append(nn.Linear(dim, dim, bias=False))
         else:
             # Deep memory: MLP with hidden layers
             # First layer: dim -> hidden_dim
-            self.layers.append(nn.Linear(self.dim, self.hidden_dim, bias=False))
+            self.layers.append(nn.Linear(dim, hidden_dim, bias=False))
 
             # Hidden layers
-            for _ in range(self.num_layers - 2):
+            for _ in range(num_layers - 2):
                 self.layers.append(
-                    nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+                    nn.Linear(hidden_dim, hidden_dim, bias=False)
                 )
 
             # Last layer: hidden_dim -> dim
-            self.layers.append(nn.Linear(self.hidden_dim, self.dim, bias=False))
+            self.layers.append(nn.Linear(hidden_dim, dim, bias=False))
 
         self.activation = get_activation(config.activation)
 
@@ -130,7 +130,7 @@ class MemoryMLP(nn.Module):
     def _init_weights(self) -> None:
         """Initialize weights with small values."""
         for layer in self.layers:
-            nn.init.normal_(layer.weight, std=self.config.init_std)
+            nn.init.normal_(layer.weight, std=self.init_std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through memory MLP.
@@ -142,10 +142,10 @@ class MemoryMLP(nn.Module):
             Output tensor of shape (batch, seq, dim)
         """
         h = x
+        last = len(self.layers) - 1
         for i, layer in enumerate(self.layers):
             h = layer(h)
-            # Apply activation for all but last layer
-            if i < len(self.layers) - 1:
+            if i < last:
                 h = self.activation(h)
         return h
 
@@ -154,7 +154,11 @@ class MemoryMLP(nn.Module):
         return [layer.weight.data.clone() for layer in self.layers]
 
     def set_weights(self, weights: list[torch.Tensor]) -> None:
-        """Set weight matrices."""
+        """Set weight matrices.
+
+        Not thread-safe: mutates layer.weight.data in-place.
+        Do not share a single NeuralLongTermMemory instance across threads.
+        """
         for layer, w in zip(self.layers, weights, strict=True):
             layer.weight.data.copy_(w)
 
@@ -193,7 +197,6 @@ class NeuralLongTermMemory(nn.Module):
     def __init__(self, config: TitansConfig) -> None:
         super().__init__()
         self.config = config
-        self.dim = config.dim
 
         # Projections for keys, values, and queries
         self.proj_k = nn.Linear(config.dim, config.dim, bias=False)
@@ -254,29 +257,24 @@ class NeuralLongTermMemory(nn.Module):
         for module in [self.proj_k, self.proj_v, self.proj_q, self.proj_out]:
             nn.init.normal_(module.weight, std=self.config.init_std)
 
+    def _apply_conv_single(self, x: torch.Tensor, conv: nn.Conv1d) -> torch.Tensor:
+        """Apply causal 1D depthwise conv to a single (batch, seq, dim) tensor."""
+        seq_len = x.shape[1]
+        x = rearrange(x, "b s d -> b d s")
+        x = conv(x)[..., :seq_len]
+        return rearrange(x, "b d s -> b s d")
+
     def _apply_conv(
         self, k: torch.Tensor, v: torch.Tensor, q: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply 1D convolution to K, V, Q."""
         if not self.use_conv:
             return k, v, q
-
-        # Reshape for conv: (batch, seq, dim) -> (batch, dim, seq)
-        k = rearrange(k, "b s d -> b d s")
-        v = rearrange(v, "b s d -> b d s")
-        q = rearrange(q, "b s d -> b d s")
-
-        # Apply causal convolution
-        k = self.conv_k(k)[..., : k.shape[-1]]
-        v = self.conv_v(v)[..., : v.shape[-1]]
-        q = self.conv_q(q)[..., : q.shape[-1]]
-
-        # Reshape back: (batch, dim, seq) -> (batch, seq, dim)
-        k = rearrange(k, "b d s -> b s d")
-        v = rearrange(v, "b d s -> b s d")
-        q = rearrange(q, "b d s -> b s d")
-
-        return k, v, q
+        return (
+            self._apply_conv_single(k, self.conv_k),
+            self._apply_conv_single(v, self.conv_v),
+            self._apply_conv_single(q, self.conv_q),
+        )
 
     def _compute_gradients(
         self,
@@ -341,20 +339,27 @@ class NeuralLongTermMemory(nn.Module):
         ]
 
     def init_state(self) -> MemoryState:
-        """Initialize memory state with zero weights and zero momentum.
+        """Initialize memory state for an empty (un-written) memory.
 
-        Memory starts empty; content accumulates only through write() calls.
-        Using zero weights ensures:
-        - retrieve() returns zero before any writes (mem_out = 0, no corruption)
-        - Baseline "no write" tests are truly clean slates
-        - MemoryMLP structural params (not in optimizer) won't pollute state
+        Weights are initialised with tiny noise (std=1e-6) rather than exact
+        zeros. This is necessary for multi-layer memory: with zero weights,
+        SiLU(W1 @ k) = SiLU(0) = 0, which kills gradients through W2 and W1
+        via the chain rule, making the first write a no-op. Tiny noise keeps
+        gradients alive while keeping retrieval output negligibly small
+        (≪ 1e-10 for typical inputs), satisfying the "empty memory" semantic.
 
-        Device is inherited from MemoryMLP weights via torch.zeros_like.
+        For single-layer linear memory, zero weights do not cause dead
+        gradients (no activation between input and weight), but we use the
+        same tiny-noise init for consistency.
+
+        Momentum starts at zero (no accumulated surprise yet).
+        Device is inherited from MemoryMLP weights.
 
         Returns:
-            Initial memory state (all zeros)
+            Initial memory state
         """
-        weights  = [torch.zeros_like(l.weight.data) for l in self.memory.layers]
+        weights  = [torch.empty_like(l.weight.data).normal_(std=1e-6)
+                    for l in self.memory.layers]
         momentum = [torch.zeros_like(l.weight.data) for l in self.memory.layers]
         return MemoryState(weights=weights, momentum=momentum)
 
@@ -362,21 +367,21 @@ class NeuralLongTermMemory(nn.Module):
         self,
         x: torch.Tensor,
         state: MemoryState | None = None,
-        return_state: bool = True,
+        update_memory: bool = True,
     ) -> tuple[torch.Tensor, MemoryState | None]:
-        """Forward pass with memory update.
+        """Forward pass with optional memory update.
 
-        This performs both:
-        1. Memory retrieval: query the memory for relevant information
-        2. Memory update: update the memory with new key-value pairs
+        Always performs memory retrieval. When update_memory=True (default),
+        also updates the memory weights with new key-value pairs.
 
         Args:
             x: Input tensor (batch, seq, dim)
-            state: Previous memory state (optional)
-            return_state: Whether to return updated state
+            state: Previous memory state (optional, initialised to zeros if None)
+            update_memory: If False, retrieval only — no gradient computation,
+                           no weight update, returns (output, None).
 
         Returns:
-            Tuple of (output, state) where output is (batch, seq, dim)
+            Tuple of (output, new_state). new_state is None when update_memory=False.
         """
         # Initialize state if needed
         if state is None:
@@ -385,30 +390,31 @@ class NeuralLongTermMemory(nn.Module):
         # Set memory weights from state
         self.memory.set_weights(state.weights)
 
-        # Project to keys, values, queries
+        # ── Query path (always needed for retrieval) ──────────────────────────
+        q = self.proj_q(x)
+        if self.use_conv:
+            q = self._apply_conv_single(q, self.conv_q)
+        q = F.silu(q)
+        q = F.normalize(q, p=2, dim=-1)
+
+        # Retrieve from memory: y_t = M*(q_t)
+        output = self.proj_out(self.memory(q))
+
+        if not update_memory:
+            return output, None
+
+        # ── Key/value path (only needed for memory update) ────────────────────
         k = self.proj_k(x)
         v = self.proj_v(x)
-        q = self.proj_q(x)
-
-        # Apply convolution
-        k, v, q = self._apply_conv(k, v, q)
-
-        # Apply SiLU activation (following paper Section 4.4)
-        k = F.silu(k)
+        if self.use_conv:
+            k = self._apply_conv_single(k, self.conv_k)
+            v = self._apply_conv_single(v, self.conv_v)
+        k = F.normalize(F.silu(k), p=2, dim=-1)
         v = F.silu(v)
-        q = F.silu(q)
-
-        # Normalize queries and keys using L2-norm (Section 4.4)
-        q = F.normalize(q, p=2, dim=-1)
-        k = F.normalize(k, p=2, dim=-1)
-
-        # Retrieve from memory using queries
-        # y_t = M*(q_t) - forward pass without weight update
-        retrieved = self.memory(q)
 
         # Compute data-dependent gates per token (batch, seq, dim)
-        alpha = self.gate_decay(x)   # (batch, seq, dim) — per-token decay
-        theta = self.gate_lr(x) * self.config.memory_lr        # per-token lr
+        alpha = self.gate_decay(x) * self.config.memory_decay      # per-token decay
+        theta = self.gate_lr(x) * self.config.memory_lr            # per-token lr
         eta = self.gate_momentum(x) * self.config.memory_momentum  # per-token momentum
 
         # Aggregate over batch+seq, keep dim → (D,) per-output-dim gates.
@@ -428,15 +434,7 @@ class NeuralLongTermMemory(nn.Module):
             state.weights, state.momentum, grads, alpha_d, eta_d, theta_d
         )
 
-        # Output projection
-        output = self.proj_out(retrieved)
-
-        # Create new state
-        new_state = MemoryState(weights=new_weights, momentum=new_momentum)
-
-        if return_state:
-            return output, new_state.detach()
-        return output, None
+        return output, MemoryState(weights=new_weights, momentum=new_momentum).detach()
 
     @staticmethod
     def _broadcast_gate(
@@ -466,8 +464,8 @@ class NeuralLongTermMemory(nn.Module):
         )
         return gate.mean()
 
+    @staticmethod
     def _standard_memory_update(
-        self,
         weights: list[torch.Tensor],
         momentum: list[torch.Tensor],
         grads: list[torch.Tensor],
@@ -491,17 +489,18 @@ class NeuralLongTermMemory(nn.Module):
         # Update momentum: S_t = eta * S_{t-1} - theta * grad
         # m and g always have the same shape, so _broadcast_gate need only
         # inspect one of them to determine the broadcast shape for both.
+        broadcast = NeuralLongTermMemory._broadcast_gate
         new_momentum = []
         for m, g in zip(momentum, grads, strict=True):
-            _eta   = self._broadcast_gate(eta,   m)
-            _theta = self._broadcast_gate(theta,  m)  # same shape as m
+            _eta   = broadcast(eta,   m)
+            _theta = broadcast(theta, m)  # same shape as m
             s = _eta * m - _theta * g
             new_momentum.append(s)
 
         # Update weights: M_t = (1 - alpha) * M_{t-1} + S_t
         new_weights = []
         for w, s in zip(weights, new_momentum, strict=True):
-            _alpha = self._broadcast_gate(alpha, w)
+            _alpha = broadcast(alpha, w)
             w_new = (1 - _alpha) * w + s
             new_weights.append(w_new)
 
@@ -528,9 +527,7 @@ class NeuralLongTermMemory(nn.Module):
         q = self.proj_q(queries)
 
         if self.use_conv:
-            q = rearrange(q, "b s d -> b d s")
-            q = self.conv_q(q)[..., : q.shape[-1]]
-            q = rearrange(q, "b d s -> b s d")
+            q = self._apply_conv_single(q, self.conv_q)
 
         q = F.silu(q)
         q = F.normalize(q, p=2, dim=-1)

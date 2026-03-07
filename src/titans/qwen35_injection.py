@@ -107,6 +107,11 @@ class Qwen35LayerWithMemory(nn.Module):
         if self._nlm_frozen:
             # Read-only: retrieve without updating state
             if self.memory_state is None:
+                logger.warning(
+                    "Layer %d: retrieve called in frozen mode with no prior write "
+                    "— returning near-zero output from empty memory",
+                    self.layer_idx,
+                )
                 self.memory_state = self.memory.init_state()
             # retrieve() applies proj_q + memory.forward() + proj_out
             mem_out = self.memory.retrieve(hidden_states, self.memory_state)
@@ -250,25 +255,25 @@ def get_trainable_params(model: nn.Module) -> list[nn.Parameter]:
     Returns:
         List of nn.Parameter objects with requires_grad=True.
     """
-    memory_param_ids: set[int] = set()
+    # Step 1: freeze everything
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    # Step 2: unfreeze NLM structural params by direct access (avoids id()
+    # cross-referencing which breaks when peft re-creates parameter objects)
     for module in model.modules():
         if isinstance(module, Qwen35LayerWithMemory):
             for name, param in module.memory.named_parameters():
                 # Exclude MemoryMLP layer weights (updated by Titans, not AdamW)
                 if not name.startswith("memory.layers."):
-                    memory_param_ids.add(id(param))
+                    param.requires_grad_(True)
 
-    trainable: list[nn.Parameter] = []
+    # Step 3: unfreeze LoRA params by name
     for name, param in model.named_parameters():
-        is_memory_struct = id(param) in memory_param_ids
-        is_lora = "lora_" in name
-        if is_memory_struct or is_lora:
+        if "lora_" in name:
             param.requires_grad_(True)
-            trainable.append(param)
-        else:
-            param.requires_grad_(False)
 
-    return trainable
+    return [p for p in model.parameters() if p.requires_grad]
 
 
 # ---------------------------------------------------------------------------

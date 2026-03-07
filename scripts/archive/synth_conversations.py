@@ -2,15 +2,24 @@
 # Copyright 2026 Delanoe Pirard / Aedelon
 # Licensed under the Apache License, Version 2.0
 
+# DEPRECATED: 此脚本已被 build_memory_data_v2.py 取代。
+# v1 局限：仅支持中文，依赖本地 9B 或 OpenAI，无 importance 字段，无 Stage 1/3。
+# 当前数据管线：scripts/build_memory_data_v2.py（MiniMax API 合成，12 语种，3 阶段）。
+
 """
-用 Qwen3.5-9B（或其他 LLM）合成中文多 session 对话，构造 Stage 2 训练数据。
+[DEPRECATED v1] 用本地 LLM 合成中文多 session 对话，构造 Stage 2 训练数据。
+
+当前数据管线：build_memory_data_v2.py（MiniMax 合成，12 语种，含 importance 字段）。
+此脚本仅供归档参考，不再用于生产。
+
+原用途：用 Qwen3.5-9B（或其他 LLM）合成中文多 session 对话，构造 Stage 2 训练数据。
 
 合成逻辑：
   1. 生成一段跨 3-5 session 的中文对话历史（含跨 session 引用）
   2. 生成一个 query（引用之前某个 session 的事件）
   3. 生成 target_memory（精简摘要，跨 session 融合）
 
-输出格式（JSONL）：与 build_oracle_data.py 输出格式相同。
+输出格式（JSONL）：与 build_memory_data_v2.py 输出格式相同。
 
 用法（本地 Qwen3.5-9B）：
     uv run python scripts/synth_conversations.py \\

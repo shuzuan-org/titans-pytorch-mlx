@@ -206,7 +206,7 @@ class MACBlock(nn.Module):
 
         # Initialize memory state if needed
         if state is None:
-            state = self.memory.init_state(batch_size, x.device)
+            state = self.memory.init_state()
 
         # Step 1 (Eq. 21): Retrieve from memory using input as query
         # h_t = M*_{t-1}(q_t) - forward pass without weight update

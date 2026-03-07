@@ -7,11 +7,13 @@ Memory Oracle 三阶段训练脚本。
 
 模型：Qwen3.5-0.8B + NLM(num_memory_layers=1) + LoRA r=16
 
-训练数据格式（JSONL，由 build_oracle_data.py 生成）：
-  {"history": [{"role": "write", "content": "..."},...],
+训练数据格式（JSONL，由 build_memory_data_v2.py 生成）：
+  {"history": [{"role": "write", "content": "...", "importance": 0|1},...],
    "query": "...",
-   "target_memory": "...",
-   "history": [..., {"importance": 0|1}]}  ← Stage 3 专用
+   "target_memory": "..."}
+
+  数据由 MiniMax API 合成，12 语种（zh/en/ja/ko/fr/es/de/ar/ru/pt/it/vi）。
+  每条 turn 内嵌 importance 字段（1=重要信息，0=噪音），Stage 3 的 importance loss 直接使用。
 
 训练策略：
   每个样本格式化为一条对话序列：
@@ -20,9 +22,9 @@ Memory Oracle 三阶段训练脚本。
   每个样本开始前 reset_memory_states()。
 
 三阶段参数差异：
-  Stage 1：lr=2e-4，steps=5000，batch=32（CMRC+DuReader）
-  Stage 2：lr=5e-5，steps=10000，batch=16（MSC+合成）
-  Stage 3：lr=1e-5，steps=3000，batch=16（+importance loss, weight=0.3）
+  Stage 1：lr=2e-4，steps=5000，batch=32（单 session 热身，直接事实，无噪音）
+  Stage 2：lr=5e-5，steps=10000，batch=16（多 session，混合噪音，跨轮综合）
+  Stage 3：lr=1e-5，steps=3000，batch=16（同实体多次更新，+importance loss weight=0.3）
 
 用法（Stage 1，单 H800）：
     uv run python scripts/train_memory_oracle.py \\
@@ -53,6 +55,7 @@ import json
 import logging
 import math
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -60,7 +63,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from titans.config import TitansConfig
@@ -90,18 +93,22 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # 从 memory_oracle 导入，确保训练/推理格式严格一致。
-# --lang en 时使用英文常量（[WRITE]/[QUERY]/[MEMORY]），zh 使用中文常量（默认）。
-# 此处先导入全部，在 main() 中根据 args.lang 赋值到模块级变量。
-from titans.memory_oracle import MEMORY_SYS_PROMPT as SYS_PROMPT   # noqa: E402
-from titans.memory_oracle import _WRITE_PREFIX as WRITE_PREFIX      # noqa: E402
-from titans.memory_oracle import _READ_PREFIX as READ_PREFIX        # noqa: E402
-from titans.memory_oracle import _TARGET_PREFIX as TARGET_PREFIX    # noqa: E402
-from titans.memory_oracle import (                                   # noqa: E402
+from titans.memory_oracle import (
+    MEMORY_SYS_PROMPT,
     MEMORY_SYS_PROMPT_EN,
+    _WRITE_PREFIX,
     _WRITE_PREFIX_EN,
+    _READ_PREFIX,
     _READ_PREFIX_EN,
+    _TARGET_PREFIX,
     _TARGET_PREFIX_EN,
 )
+
+# 按语言索引 markers，键为 --lang 值。
+_MARKERS: dict[str, tuple[str, str, str, str]] = {
+    "zh": (MEMORY_SYS_PROMPT,    _WRITE_PREFIX,    _READ_PREFIX,    _TARGET_PREFIX),
+    "en": (MEMORY_SYS_PROMPT_EN, _WRITE_PREFIX_EN, _READ_PREFIX_EN, _TARGET_PREFIX_EN),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -126,13 +133,24 @@ class OracleDataset(Dataset):
         tokenizer: Any,
         max_seq_len: int = 2048,
         stage: int = 1,
+        markers: tuple[str, str, str, str] | None = None,
     ) -> None:
+        """
+        Args:
+            markers: (sys_prompt, write_prefix, read_prefix, target_prefix).
+                     如果为 None，使用中文默认（向后兼容）。
+        """
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.stage = stage
         self.samples = []
-        # 缓存 SYS_PROMPT 前缀 token IDs，避免在每次 __getitem__ 中重复 encode
-        self._sys_ids: list[int] = tokenizer.encode(SYS_PROMPT + "\n", add_special_tokens=True)
+
+        if markers is None:
+            markers = _MARKERS["zh"]
+        sys_prompt, self._write_prefix, self._read_prefix, self._target_prefix = markers
+
+        # 缓存 sys_prompt 前缀 token IDs，避免在每次 __getitem__ 中重复 encode
+        self._sys_ids: list[int] = tokenizer.encode(sys_prompt + "\n", add_special_tokens=True)
 
         with Path(jsonl_path).open(encoding="utf-8") as f:
             for line in f:
@@ -155,7 +173,7 @@ class OracleDataset(Dataset):
 
         # read_ids 必须始终在 prefix 末尾，单独计算以便截断时保留
         read_ids = self.tokenizer.encode(
-            READ_PREFIX + query + "\n" + TARGET_PREFIX, add_special_tokens=False
+            self._read_prefix + query + "\n" + self._target_prefix, add_special_tokens=False
         )
 
         # 各部分 token 预算：sys + writes + read + target <= max_seq_len
@@ -169,7 +187,7 @@ class OracleDataset(Dataset):
             write_entries: list[tuple[list[int], int]] = []  # (token_ids, importance 0|1)
             for turn in history:
                 ids = self.tokenizer.encode(
-                    WRITE_PREFIX + turn["content"] + "\n", add_special_tokens=False
+                    self._write_prefix + turn["content"] + "\n", add_special_tokens=False
                 )
                 write_entries.append((ids, int(turn.get("importance", 0))))
 
@@ -182,7 +200,7 @@ class OracleDataset(Dataset):
             write_token_ids = [t for ids, _ in write_entries for t in ids]
         else:
             # Stage 1/2：整体 tokenize，保留跨段 BPE 合并，token 效率更高
-            write_text = "".join(WRITE_PREFIX + turn["content"] + "\n" for turn in history)
+            write_text = "".join(self._write_prefix + turn["content"] + "\n" for turn in history)
             all_write_ids = self.tokenizer.encode(write_text, add_special_tokens=False)
             # write_budget 可能为 0（Python `-0` 陷阱：all[-0:] = all），必须显式处理
             if write_budget <= 0:
@@ -221,6 +239,73 @@ class OracleDataset(Dataset):
 
         result["labels"] = labels
         return result
+
+
+class WeightedConcatDataset(Dataset):
+    """多文件加权混合数据集。
+
+    根据 weights 对各子数据集按比例采样，构造一个固定大小的预混洗索引列表。
+    总大小 = 所有子数据集样本数之和（自然大小），各语言按 weight 决定占比。
+    不满足目标数量时重复采样（小语种），超出时截断（大语种）。
+
+    与 DistributedSampler 完全兼容（本身就是 Dataset）。
+
+    Args:
+        datasets: 子 Dataset 列表
+        weights:  各子数据集的采样权重（未归一化）；None 表示等权
+        seed:     用于复现的随机种子
+    """
+
+    def __init__(
+        self,
+        datasets: list[Dataset],
+        weights: list[float] | None = None,
+        seed: int = 42,
+    ) -> None:
+        assert datasets, "datasets must be non-empty"
+        if weights is None:
+            weights = [1.0] * len(datasets)
+        assert len(weights) == len(datasets), "--data-weights count must match --data count"
+
+        total_w = sum(weights)
+        norm_w = [w / total_w for w in weights]
+        natural_total = sum(len(d) for d in datasets)
+
+        rng = random.Random(seed)
+        flat: list[tuple[int, int]] = []  # (dataset_idx, sample_idx)
+        for di, (ds, w) in enumerate(zip(datasets, norm_w)):
+            # round() 导致各语言目标之和与 natural_total 可能差 ±len(datasets) 个样本，
+            # 这对训练无影响，属于故意的近似。
+            target = round(natural_total * w)
+            n = len(ds)
+            if target == 0:
+                continue
+            if target <= n:
+                idxs = rng.sample(range(n), target)
+            else:
+                full = target // n
+                rem  = target % n
+                idxs = list(range(n)) * full + rng.sample(range(n), rem)
+            flat.extend((di, i) for i in idxs)
+
+        rng.shuffle(flat)
+        self._flat = flat
+        self._datasets = datasets
+
+        counts = {i: 0 for i in range(len(datasets))}
+        for di, _ in flat:
+            counts[di] += 1
+        log.info(
+            "WeightedConcatDataset: total=%d  per-dataset=%s",
+            len(flat), [counts[i] for i in range(len(datasets))],
+        )
+
+    def __len__(self) -> int:
+        return len(self._flat)
+
+    def __getitem__(self, idx: int) -> dict:
+        di, si = self._flat[idx]
+        return self._datasets[di][si]
 
 
 def make_collate_fn(pad_id: int):
@@ -666,7 +751,11 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--stage", type=int, choices=[1, 2, 3], default=1)
     p.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
-    p.add_argument("--data", required=True, help="JSONL training data file")
+    p.add_argument("--data", required=True, nargs="+",
+                   help="JSONL training data file(s). Multiple files → mixed training.")
+    p.add_argument("--data-weights", nargs="+", type=float, default=None,
+                   help="Per-file sampling weights (parallel to --data). "
+                        "Defaults to equal weights. Example: --data-weights 2 1 1 for 2:1:1 ratio.")
     p.add_argument("--output", required=True, help="Output checkpoint directory")
     p.add_argument("--resume", default=None,
                    help="Resume from: peft final/ dir or step_*.pt file/dir")
@@ -702,8 +791,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-8bit-adam", action="store_true")
     p.add_argument("--multi-gpu", action="store_true",
                    help="Enable multi-GPU DDP (launch with torchrun --nproc_per_node=N)")
-    p.add_argument("--lang", default="zh", choices=["zh", "en"],
-                   help="Training language: zh=Chinese markers (default), en=English markers")
+    p.add_argument("--lang", default=None, choices=["zh", "en"],
+                   help="Marker language: en=[WRITE]/[QUERY]/[MEMORY], zh=【写入】/【查询】/【记忆】. "
+                        "Required when using multiple --data files. "
+                        "Single-file default: zh (backward compatible).")
 
     return p.parse_args()
 
@@ -728,17 +819,20 @@ def main() -> None:
     if args.batch_size is None:
         args.batch_size = defaults["batch_size"]
 
-    # 根据 --lang 切换模块级 prompt 常量，使 OracleDataset 使用正确的格式。
-    # globals() 修改生效于 OracleDataset 创建之前（在 __init__ 中缓存 _sys_ids）。
-    if args.lang == "en":
-        g = globals()
-        g["SYS_PROMPT"]    = MEMORY_SYS_PROMPT_EN
-        g["WRITE_PREFIX"]  = _WRITE_PREFIX_EN
-        g["READ_PREFIX"]   = _READ_PREFIX_EN
-        g["TARGET_PREFIX"] = _TARGET_PREFIX_EN
-        log.info("Language: EN  markers=[WRITE]/[QUERY]/[MEMORY]")
-    else:
-        log.info("Language: ZH  markers=【写入】/【查询】/【记忆】")
+    # 确定 markers 语言
+    if args.lang is None:
+        if len(args.data) > 1:
+            raise ValueError(
+                "--lang is required when using multiple --data files. "
+                "For multilingual mixed training use --lang en."
+            )
+        args.lang = "zh"  # 单文件向后兼容默认值
+
+    markers = _MARKERS[args.lang]
+    log.info(
+        "Language: %s  markers=%s/%s/%s",
+        args.lang.upper(), markers[1].strip(), markers[2].strip(), markers[3].strip(),
+    )
 
     log.info("=== Memory Oracle Stage %d ===", args.stage)
     log.info("  model=%s  lr=%.1e  steps=%d  batch=%d  accum=%d",
@@ -765,8 +859,18 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Dataset
-    dataset = OracleDataset(args.data, tokenizer, args.seq_len, args.stage)
+    # Dataset（单文件或多文件加权混合）
+    if len(args.data) == 1:
+        dataset: Dataset = OracleDataset(
+            args.data[0], tokenizer, args.seq_len, args.stage, markers=markers,
+        )
+    else:
+        sub_datasets = [
+            OracleDataset(p, tokenizer, args.seq_len, args.stage, markers=markers)
+            for p in args.data
+        ]
+        dataset = WeightedConcatDataset(sub_datasets, args.data_weights, seed=args.seed)
+        log.info("Mixed training: %d files → %d total samples", len(args.data), len(dataset))
 
     # 用 factory 生成 collate_fn，固定正确的 pad_id（Qwen3.5 eos = 151643）
     pad_id = tokenizer.pad_token_id

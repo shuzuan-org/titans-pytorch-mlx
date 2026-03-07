@@ -2,8 +2,16 @@
 # Copyright 2026 Delanoe Pirard / Aedelon
 # Licensed under the Apache License, Version 2.0
 
+# DEPRECATED: 此脚本是 v1 数据管线，已被 build_memory_data_v2.py 取代。
+# v1 局限：仅支持中文，依赖 CMRC/DuReader/MSC 公开数据集，无 importance 字段，
+#          Stage 1 是文档 QA 而非记忆任务，Stage 2 target 是助手回复而非记忆摘要。
+# 当前数据管线：scripts/build_memory_data_v2.py（MiniMax API 合成，12 语种）。
+
 """
-构造 Memory Oracle 训练数据（Write→Read 格式）。
+[DEPRECATED v1] 构造 Memory Oracle 训练数据（Write→Read 格式）。
+
+当前数据管线：build_memory_data_v2.py（MiniMax 合成，12 语种，含 importance 字段）。
+此脚本仅供归档参考，不再用于生产。
 
 支持以下数据来源：
   Stage 1：CMRC 2018、DuReader（文档理解）

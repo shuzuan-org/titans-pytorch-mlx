@@ -749,7 +749,7 @@ logits, states = model(input_ids, states=None)
 # Returns: logits (batch, seq_len, vocab_size), new states
 
 # Memory forward signature
-output, state = memory(x, state=None, return_state=True)
+output, state = memory(x, state=None, update_memory=True)
 # x: (batch, seq_len, dim)
 # state: Optional MemoryState
 # Returns: output (batch, seq_len, dim), new state

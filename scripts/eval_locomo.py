@@ -194,29 +194,57 @@ def load_locomo(data_path: str | Path) -> list[dict]:
         )
 
 
+# LOCOMO category 数字 → 名称
+_LOCOMO_CAT = {"1": "single-hop", "2": "multi-hop", "3": "temporal",
+               "4": "open-ended", "5": "adversarial"}
+
+
+def _parse_conv_list(conv: Any) -> list:
+    """将各种格式的对话字段转为 turn 列表。
+
+    支持：
+    - list（标准格式）
+    - str（纯文本）
+    - dict（LOCOMO 格式：{session_1: [...], session_2: [...], ...}）
+    """
+    if isinstance(conv, str):
+        return [{"text": conv}]
+    if isinstance(conv, list):
+        return conv
+    if isinstance(conv, dict):
+        # LOCOMO: session_1, session_2, ... 按编号排序展平
+        sessions = sorted(
+            [(k, v) for k, v in conv.items()
+             if k.startswith("session_") and isinstance(v, list)
+             and not k.endswith("_date_time")],
+            key=lambda x: int(x[0].split("_")[1]),
+        )
+        return [turn for _, turns in sessions for turn in turns]
+    return []
+
+
 def flatten_qa_pairs(locomo_data: list[dict]) -> list[dict]:
     """将 LOCOMO 数据展平为 QA pair 列表。
 
     每个 QA pair 包含 conv_idx（该对话在 locomo_data 中的位置），
     用于在 eval_with_oracle 中正确分组——避免 id() 在 JSON 解析对象上失效的问题。
+
+    支持 snap-research/locomo 格式：
+      conversation: dict of session_N lists
+      qa: list of {question, answer, evidence, category(int)}
     """
     qa_pairs = []
     for conv_idx, item in enumerate(locomo_data):
-        # 提取对话历史
-        conv = item.get("conversation", item.get("dialog", item.get("history", [])))
-        if isinstance(conv, str):
-            conv_list = [{"text": conv}]
-        elif isinstance(conv, list):
-            conv_list = conv
-        else:
-            conv_list = []
+        conv_raw = item.get("conversation", item.get("dialog", item.get("history", [])))
+        conv_list = _parse_conv_list(conv_raw)
 
-        # 提取 QA pairs（支持多个 question per conversation）
-        questions = item.get("questions", item.get("qa_pairs", []))
+        # 支持 qa / questions / qa_pairs 三种字段名
+        questions = item.get("qa", item.get("questions", item.get("qa_pairs", [])))
         if not questions:
             q = item.get("question", "")
             a = item.get("answer", item.get("reference", ""))
-            cat = item.get("category", item.get("type", "unknown"))
+            cat = str(item.get("category", item.get("type", "unknown")))
+            cat = _LOCOMO_CAT.get(cat, cat)
             if q and a:
                 qa_pairs.append({
                     "conv_idx": conv_idx,
@@ -229,7 +257,8 @@ def flatten_qa_pairs(locomo_data: list[dict]) -> list[dict]:
             for qa in questions:
                 q = qa.get("question", "")
                 a = qa.get("answer", qa.get("reference", ""))
-                cat = qa.get("category", qa.get("type", "unknown"))
+                cat = str(qa.get("category", qa.get("type", "unknown")))
+                cat = _LOCOMO_CAT.get(cat, cat)
                 if q and a:
                     qa_pairs.append({
                         "conv_idx": conv_idx,

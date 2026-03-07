@@ -13,7 +13,7 @@ fi
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATE=$(date +%Y-%m-%d)
-DESC=$(echo "$1" | tr ' /\\'"'"'"' '-' | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-64)
+DESC=$(printf '%s' "$1" | sed 's/[^a-zA-Z0-9._-]/-/g; s/--*/-/g; s/^-//; s/-$//' | cut -c1-64)
 DIR="$PROJECT_ROOT/docs/log/${DATE}"
 FILE="$DIR/${DESC}.md"
 

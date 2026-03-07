@@ -52,27 +52,31 @@ bias_count=$(awk '/^## 项目特有偏差/{found=1; next} /^## /{found=0} found 
 echo "   共 $bias_count 条"
 
 # 5. 导航链接检查
+# 提取两种格式：[text](path) 和 → **path** 或 → path
 echo ""
 echo "🔗 导航链接:"
 broken=0
 while IFS= read -r link; do
     [ -z "$link" ] && continue
-    if [[ "$link" == memory/* ]] || [[ "$link" == *.md && ! "$link" == /* ]]; then
-        if [[ "$link" == memory/* ]]; then
-            check_path="$MEMORY_DIR/${link#memory/}"
-        elif [[ "$link" == decisions.md ]] || [[ "$link" == bottlenecks.md ]]; then
-            check_path="$MEMORY_DIR/$link"
-        else
-            check_path="$PROJECT_ROOT/$link"
-        fi
-        if [ -e "$check_path" ]; then
-            echo "   ✅ $link"
-        else
-            echo "   ❌ 断链: $link"
-            ((broken++)) || true
-        fi
+    # 解析路径：decisions.md / bottlenecks.md 在 MEMORY_DIR，其余在 PROJECT_ROOT
+    if [[ "$link" == decisions.md || "$link" == bottlenecks.md ]]; then
+        check_path="$MEMORY_DIR/$link"
+    elif [[ "$link" == /* ]]; then
+        check_path="$link"
+    else
+        check_path="$PROJECT_ROOT/$link"
     fi
-done < <(awk '/^## 导航/{found=1; next} /^## /{found=0} found' "$MEMORY" | grep -oP '\[.*?\]\(\K[^)]+' || true)
+    if [ -e "$check_path" ]; then
+        echo "   ✅ $link"
+    else
+        echo "   ❌ 断链: $link"
+        broken=$((broken + 1))
+    fi
+done < <(
+    awk '/^## 导航/{found=1; next} /^## /{found=0} found' "$MEMORY" | \
+    grep -oP '(?<=\]\()[^)]+|(?<=→ \*\*)[^*]+(?=\*\*)|(?<=→ )[a-zA-Z0-9_./-]+(?=（|$| )' | \
+    grep -v '^$' || true
+)
 [ "$broken" -eq 0 ] && echo "   全部有效"
 
 # 6. Journal 状态
@@ -130,7 +134,7 @@ echo ""
 echo "🏷  标注统计（journal 最近 7 天）:"
 confirm_count=0
 guess_count=0
-cutoff=$(date -d "7 days ago" +%Y-%m-%d 2>/dev/null || date -v-7d +%Y-%m-%d 2>/dev/null || echo "0000-00-00")
+cutoff=$(date -d "7 days ago" +%Y-%m-%d)
 while IFS= read -r f; do
     day=$(basename "$(dirname "$f")")
     [[ "$day" < "$cutoff" ]] && continue

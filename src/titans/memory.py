@@ -340,7 +340,7 @@ class NeuralLongTermMemory(nn.Module):
             for g, p in zip(grads, self.memory.parameters(), strict=True)
         ]
 
-    def init_state(self, _batch_size: int, _device: torch.device) -> MemoryState:
+    def init_state(self) -> MemoryState:
         """Initialize memory state with zero weights and zero momentum.
 
         Memory starts empty; content accumulates only through write() calls.
@@ -349,16 +349,14 @@ class NeuralLongTermMemory(nn.Module):
         - Baseline "no write" tests are truly clean slates
         - MemoryMLP structural params (not in optimizer) won't pollute state
 
-        Args:
-            _batch_size: Batch size (reserved for future per-sample memory)
-            _device: Device for tensors (reserved for future use)
+        Device is inherited from MemoryMLP weights via torch.zeros_like.
 
         Returns:
             Initial memory state (all zeros)
         """
         ref_weights = self.memory.get_weights()
-        weights   = [torch.zeros_like(w) for w in ref_weights]
-        momentum  = [torch.zeros_like(w) for w in ref_weights]
+        weights  = [torch.zeros_like(w) for w in ref_weights]
+        momentum = [torch.zeros_like(w) for w in ref_weights]
         return MemoryState(weights=weights, momentum=momentum)
 
     def forward(
@@ -381,12 +379,9 @@ class NeuralLongTermMemory(nn.Module):
         Returns:
             Tuple of (output, state) where output is (batch, seq, dim)
         """
-        batch_size = x.shape[0]
-        device = x.device
-
         # Initialize state if needed
         if state is None:
-            state = self.init_state(batch_size, device)
+            state = self.init_state()
 
         # Set memory weights from state
         self.memory.set_weights(state.weights)
@@ -495,10 +490,12 @@ class NeuralLongTermMemory(nn.Module):
             Tuple of (new_weights, new_momentum)
         """
         # Update momentum: S_t = eta * S_{t-1} - theta * grad
+        # m and g always have the same shape, so _broadcast_gate need only
+        # inspect one of them to determine the broadcast shape for both.
         new_momentum = []
         for m, g in zip(momentum, grads, strict=True):
-            _eta = self._broadcast_gate(eta, m)
-            _theta = self._broadcast_gate(theta, g)
+            _eta   = self._broadcast_gate(eta,   m)
+            _theta = self._broadcast_gate(theta,  m)  # same shape as m
             s = _eta * m - _theta * g
             new_momentum.append(s)
 

@@ -30,14 +30,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-logger = logging.getLogger(__name__)
-
 from titans.config import TitansConfig
+
+logger = logging.getLogger(__name__)
 
 # Import optimizations
 try:
     from titans.cuda_optimizations import (
-        batched_memory_update,
         compute_memory_gradients_efficient,
     )
     HAS_CUDA_OPTIMIZATIONS = True
@@ -470,6 +469,9 @@ class NeuralLongTermMemory(nn.Module):
         if not isinstance(gate, torch.Tensor) or gate.dim() == 0:
             return gate
         if gate.shape[0] == w.shape[0]:
+            # Assumes gate.shape[0] == model_dim (D), not hidden_dim.
+            # Incorrect if memory_hidden_mult == 1.0 (hidden_dim == D), but that
+            # is not a supported configuration and not used by the Oracle.
             return gate.unsqueeze(-1)  # (D,) → (D, 1) for row-wise scaling
         # Shape mismatch (deep memory hidden layers: D_out == hidden_dim != D)
         # Fall back to scalar to avoid incorrect broadcasting.

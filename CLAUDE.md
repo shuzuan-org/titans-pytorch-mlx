@@ -79,11 +79,11 @@ uv run python scripts/train_memory_oracle.py --stage 1 \
 
 uv run python scripts/train_memory_oracle.py --stage 2 \
   --data data/memory_v2/stage2.jsonl \
-  --resume checkpoints/oracle_stage1 --output checkpoints/oracle_stage2
+  --resume checkpoints/oracle_stage1/final --output checkpoints/oracle_stage2
 
 uv run python scripts/train_memory_oracle.py --stage 3 \
   --data data/memory_v2/stage3.jsonl \
-  --resume checkpoints/oracle_stage2 --output checkpoints/oracle_stage3
+  --resume checkpoints/oracle_stage2/final --output checkpoints/oracle_stage3
 ```
 
 ---

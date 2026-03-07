@@ -106,11 +106,8 @@ class Qwen35LayerWithMemory(nn.Module):
         """
         if self._nlm_frozen:
             # Read-only: retrieve without updating state
-            batch_size, _seq, _dim = hidden_states.shape
             if self.memory_state is None:
-                self.memory_state = self.memory.init_state(
-                    batch_size, hidden_states.device
-                )
+                self.memory_state = self.memory.init_state()
             # retrieve() applies proj_q + memory.forward() + proj_out
             mem_out = self.memory.retrieve(hidden_states, self.memory_state)
         else:

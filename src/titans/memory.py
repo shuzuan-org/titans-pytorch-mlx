@@ -354,9 +354,8 @@ class NeuralLongTermMemory(nn.Module):
         Returns:
             Initial memory state (all zeros)
         """
-        ref_weights = self.memory.get_weights()
-        weights  = [torch.zeros_like(w) for w in ref_weights]
-        momentum = [torch.zeros_like(w) for w in ref_weights]
+        weights  = [torch.zeros_like(l.weight.data) for l in self.memory.layers]
+        momentum = [torch.zeros_like(l.weight.data) for l in self.memory.layers]
         return MemoryState(weights=weights, momentum=momentum)
 
     def forward(

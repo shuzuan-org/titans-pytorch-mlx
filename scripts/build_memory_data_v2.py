@@ -52,7 +52,7 @@ import re
 import sys
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as futures_wait
 from pathlib import Path
 from typing import Any
 
@@ -274,8 +274,7 @@ Output strictly as JSON, no extra text:
 {{
   "writes": [
     {{"time": "Monday", "content": "...", "is_noise": false}},
-    {{"time": "Tuesday", "content": "Had takeout for lunch", "is_noise": true}},
-    ...
+    {{"time": "Tuesday", "content": "(mundane daily event unrelated to query, specific and unique)", "is_noise": true}}
   ],
   "query": "...",
   "target_memory": "The user ..."
@@ -308,8 +307,8 @@ Output strictly as JSON, no extra text:
       "session_id": 1,
       "time_label": "3 months ago",
       "writes": [
-        {{"content": "...", "is_noise": false}},
-        {{"content": "Nice weather today", "is_noise": true}}
+        {{"content": "(key event related to the topic, specific details)", "is_noise": false}},
+        {{"content": "(mundane daily event unrelated to query, specific and unique — no weather/food clichés)", "is_noise": true}}
       ]
     }}
   ],
@@ -317,41 +316,8 @@ Output strictly as JSON, no extra text:
   "target_memory": "..."
 }}"""
 
-STAGE3_PROMPT_EN = """Generate one memory training sample (information update stage).
-
-Topic: {topic}
-Requirements: Show the same entity changing state across time (new info should override old info)
-
-Must include:
-1. The same entity (person/project/relationship/status) at 3 different time points
-   Example: ["Alex is an intern" → "Alex became a full-time engineer" → "Alex was promoted to lead"]
-2. 1-2 noise entries at each time point
-3. query asks about the entity's CURRENT state
-4. target_memory describes only the LATEST state (no history recap)
-
-Output strictly as JSON, no extra text:
-{{
-  "entity": "name of the tracked entity",
-  "updates": [
-    {{
-      "time_label": "6 months ago",
-      "signal": "entity's state description",
-      "noise": ["noise content 1"]
-    }},
-    {{
-      "time_label": "3 months ago",
-      "signal": "updated state",
-      "noise": ["noise content"]
-    }},
-    {{
-      "time_label": "last week",
-      "signal": "latest state",
-      "noise": ["noise content"]
-    }}
-  ],
-  "query": "...",
-  "target_memory": "(latest state only) ..."
-}}"""
+# Stage 3 使用多步生成（INIT → CONT × N → QUERY），见 _generate_one_long_s3_sample()。
+# 不使用单次调用方案：400-600 条 entry 单次输出质量差且容易用省略号敷衍。
 
 
 # ---------------------------------------------------------------------------
@@ -381,9 +347,9 @@ STAGE1_PROMPT = """生成一个记忆训练样本（热身阶段）。
 严格按以下JSON格式输出，不要有任何额外文字：
 {{
   "writes": [
-    {{"time": "周一", "content": "...", "is_noise": false}},
-    {{"time": "周二", "content": "今天吃了外卖", "is_noise": true}},
-    ...
+    {{"time": "周一", "content": "（与主题相关的关键事件，具体描述）", "is_noise": false}},
+    {{"time": "周二", "content": "（与查询完全无关的日常琐事，具体且唯一，禁用天气/饮食套话）", "is_noise": true}},
+    {{"time": "周三", "content": "（另一条关键信息或状态变化）", "is_noise": false}}
   ],
   "query": "...",
   "target_memory": "用户..."
@@ -398,11 +364,23 @@ session 数：{n_sessions}
 查询类型：{query_type}
 
 要求：
-1. 写入记录：10-20条，跨 {n_sessions} 个 session，每个 session 2-5条
-2. 重要记录（2-5条）：影响用户生活/决策的关键事件，需在后续 session 中被引用
-3. 噪音记录（6-12条）：日常琐碎，与query完全无关
+1. 写入记录：10-15条，跨 {n_sessions} 个 session，每个 session 2-4条
+2. 重要记录（5-8条）：影响用户生活/决策的关键事件，需在后续 session 中被引用
+3. 噪音记录（4-6条）：日常琐碎，与query完全无关；噪音不超过总条数的40%
 4. 至少1处跨 session 引用（用户提到"上次说的"、"之前提过"等）
 5. 如果是"变化历程"或"当前状态"类query，同一实体在不同时间有状态更新
+
+噪音多样性要求（重要）：
+- 每条噪音内容必须具体且唯一，禁止重复同类短语
+- 禁止使用"天气不错/阳光很好"或"吃了牛肉面/外卖/咖啡"作为模板，这些过于泛滥
+- 噪音必须覆盖不同生活维度，例如：
+  * 购物/快递：买了什么、快递延误、退货
+  * 出行/交通：堵车、找停车位、骑车摔跤
+  * 健康/睡眠：失眠、运动、感冒、体检
+  * 娱乐：看了什么剧/书/展览、打游戏
+  * 社交：朋友临时取消约会、邻居的事
+  * 家务/家庭：修东西、宠物、父母来访
+  * 工作琐事：系统崩溃、打印机卡纸、会议取消
 
 target_memory 要求：
 - 只综合与 query 相关的重要记录
@@ -417,8 +395,8 @@ target_memory 要求：
       "session_id": 1,
       "time_label": "3个月前",
       "writes": [
-        {{"content": "...", "is_noise": false}},
-        {{"content": "今天天气不错", "is_noise": true}}
+        {{"content": "（与主题相关的关键事件）", "is_noise": false}},
+        {{"content": "（与主题无关的具体日常琐事，每条都不同）", "is_noise": true}}
       ]
     }}
   ],
@@ -426,42 +404,153 @@ target_memory 要求：
   "target_memory": "..."
 }}"""
 
-# Stage 3：信息更新（同实体多次更新，target 只含最新状态）
-STAGE3_PROMPT = """生成一个记忆训练样本（信息更新阶段）。
+# Stage 3：分段生成（多步 API 调用），对标 LOCOMO 真实长对话场景（400-600 轮）
+# 生成流程：INIT → CONT × (n_sessions-1) → QUERY，三类 prompt。
+
+# ------ 中文版 ------
+
+STAGE3_INIT_PROMPT_ZH = """生成一段长期对话记忆训练样本的第1个会话（共约{n_sessions}个会话）。
 
 主题：{topic}
-要求：体现同一实体在不同时间的状态更新（旧信息应被新信息覆盖）
 
-必须包含：
-1. 同一实体（人/项目/关系/状态）在3个不同时间点的变化记录
-   例：["张三是实习生" → "张三转正成工程师" → "张三升任主管"]
-2. 每个时间点混入1-2条噪音记录
-3. query 询问该实体的"当前"状态
-4. target_memory 只描述最新状态，不列举变化历程
+本会话要求：
+1. 引入3-5个核心实体（人物/项目/关系），后续会话将持续追踪它们的演变
+2. 包含{turns}条记录，每条一行，noise占40-60%（日常琐碎，与核心主题无关）
+3. 不要加"X天前"类时间标签，用自然语言体现时序感
+4. entities 列表中注明每个实体的初始角色（如"张三（求职者）"）
+
+噪音多样性要求：噪音内容必须具体且唯一，覆盖不同生活维度（购物、出行、健康、娱乐、社交、家务、工作琐事等），严禁使用"吃外卖/吃什么/天气不错"等过于泛滥的模板。
 
 严格按以下JSON格式输出，不要有任何额外文字：
 {{
-  "entity": "被追踪的实体名称",
-  "updates": [
-    {{
-      "time_label": "6个月前",
-      "signal": "实体的状态描述",
-      "noise": ["噪音内容1"]
-    }},
-    {{
-      "time_label": "3个月前",
-      "signal": "更新后的状态",
-      "noise": ["噪音内容"]
-    }},
-    {{
-      "time_label": "上周",
-      "signal": "最新状态",
-      "noise": ["噪音内容"]
-    }}
-  ],
-  "query": "...",
-  "target_memory": "（只描述最新状态）..."
+  "entities": ["（实体A，格式：姓名+角色，如 张三（初创公司创始人））", "（实体B）", "（实体C）"],
+  "session_id": 1,
+  "writes": [
+    {{"content": "（实体A的初始状态或背景信息，具体描述）", "is_noise": false}},
+    {{"content": "（与所有追踪实体无关的生活细节，具体且独特）", "is_noise": true}},
+    {{"content": "（实体B的初始状态或引入事件）", "is_noise": false}},
+    {{"content": "（不同生活维度的另一条琐事，类型与上条不同）", "is_noise": true}}
+  ]
 }}"""
+
+STAGE3_CONT_PROMPT_ZH = """这是一段长期对话记忆的第{session_id}个会话（共约{n_sessions}个）。
+
+持续追踪的实体：
+{entities_str}
+
+前序关键事件（摘要，按时间顺序）：
+{key_events_str}
+
+本会话要求：
+1. 包含{turns}条记录，其中 is_noise=true 的条数必须在 {turns} 的 40-50% 之间
+2. 自然推进实体状态：可以有新发展、状态改变、引用之前事件（"上次提到的..."）
+3. 至少1条跨会话引用（提及之前发生的事）
+4. 不加时间标签
+5. 噪音内容要求：必须覆盖不同生活维度，每条噪音类型不同——
+   购物/快递、出行/交通/停车、健康/睡眠/运动、娱乐（电影/书/游戏/展览）、
+   社交（朋友/邻居/家人临时事件）、家务/宠物/维修、工作琐事（系统崩溃/会议取消等）
+   严禁连续使用同类噪音（如多条都是购物）
+
+严格按以下JSON格式输出，不要有任何额外文字：
+{{
+  "session_id": {session_id},
+  "writes": [
+    {{"content": "（具体的关键信息，推进某实体状态）", "is_noise": false}},
+    {{"content": "（具体的日常琐事，与所有实体无关，类型独特）", "is_noise": true}}
+  ]
+}}"""
+
+STAGE3_QUERY_PROMPT_ZH = """基于以下长期对话的全部关键事件，生成一个高质量的多跳查询问题和记忆摘要。
+
+持续追踪的实体：
+{entities_str}
+
+全部关键事件（按时间顺序，共{n_signals}条）：
+{key_events_str}
+
+要求：
+- query 必须是以下类型之一：
+  a. 多跳问题：需综合不同时期的信息才能回答（如"X事件发生时，Y的状态是什么？"）
+  b. 变化追踪：某实体从开始到最近的完整变化历程
+  c. 跨实体关联：两个实体之间关系或相互影响的演变
+- target_memory：综合相关事件，150字以内，自然语言，描述背景记忆（不是直接回答问题）
+
+严格按以下JSON格式输出，不要有任何额外文字：
+{{
+  "query": "...",
+  "target_memory": "..."
+}}"""
+
+# ------ 英文版 ------
+
+STAGE3_INIT_PROMPT_EN = """Generate session 1 of a long-term memory training sample (approx. {n_sessions} sessions total).
+
+Topic: {topic}
+
+Requirements for this session:
+1. Introduce 3-5 core entities (people/projects/relationships) that will evolve across subsequent sessions
+2. Include {turns} write entries, with 40-60% noise (unrelated daily chatter)
+3. No explicit time labels like "3 months ago" — use natural conversational cues for temporal flow
+4. In the entities list, note each entity's initial role (e.g., "Alex (job seeker)")
+
+Noise diversity rules: Every noise entry must be specific and unique, spanning different life domains (shopping, commute, health, entertainment, social, home/pets, work annoyances, etc.). NEVER use "had lunch/coffee" or "nice weather" — these are overused templates.
+
+Output strictly as JSON, no extra text:
+{{
+  "entities": ["(Entity A: name + role, e.g. Alex (startup founder))", "(Entity B)", "(Entity C)"],
+  "session_id": 1,
+  "writes": [
+    {{"content": "(Entity A's initial state or background, specific details)", "is_noise": false}},
+    {{"content": "(Mundane daily event unrelated to all tracked entities, concrete and unique)", "is_noise": true}},
+    {{"content": "(Entity B's initial state or first appearance event)", "is_noise": false}},
+    {{"content": "(Different life domain mundane event, different category from the noise above)", "is_noise": true}}
+  ]
+}}"""
+
+STAGE3_CONT_PROMPT_EN = """This is session {session_id} of a long-term memory conversation (approx. {n_sessions} sessions total).
+
+Entities being tracked:
+{entities_str}
+
+Key events from previous sessions (chronological summary):
+{key_events_str}
+
+Requirements for this session:
+1. Include {turns} write entries; is_noise=true entries must be 40-50% of {turns}
+2. Naturally advance entity states: new developments, status changes, cross-session references ("remember when I mentioned...")
+3. At least 1 cross-session callback referencing a past event
+4. No time labels
+5. Noise diversity: each noise entry must be from a different life domain — shopping/deliveries, commute/traffic/parking, health/sleep/exercise, entertainment (movies/books/games/exhibits), social (friends/neighbors/family dropping by), home/pets/repairs, work annoyances (system crash, meeting cancelled, etc.). NEVER repeat the same noise category consecutively.
+
+Output strictly as JSON, no extra text:
+{{
+  "session_id": {session_id},
+  "writes": [
+    {{"content": "(concrete key event advancing an entity's state)", "is_noise": false}},
+    {{"content": "(mundane daily event unrelated to all entities, unique and specific)", "is_noise": true}}
+  ]
+}}"""
+
+STAGE3_QUERY_PROMPT_EN = """Based on the full key events from a long-term conversation, generate a high-quality multi-hop query and memory summary.
+
+Entities tracked:
+{entities_str}
+
+All key events (chronological, {n_signals} total):
+{key_events_str}
+
+Requirements:
+- query must be one of:
+  a. Multi-hop: requires combining info from different time periods (e.g., "When X happened, what was Y's situation?")
+  b. Change tracking: full evolution of one entity from start to most recent state
+  c. Cross-entity: how two entities' relationship or mutual influence evolved
+- target_memory: synthesizes relevant events, under 150 words, natural language, describes background memory (not a direct answer)
+
+Output strictly as JSON, no extra text:
+{{
+  "query": "...",
+  "target_memory": "..."
+}}\""""
 
 
 # ---------------------------------------------------------------------------
@@ -551,32 +640,249 @@ def _stage2_to_sample(parsed: dict) -> dict | None:
     return {"history": history, "query": query, "target_memory": target, "source": "memory_v2_s2"}
 
 
-def _stage3_to_sample(parsed: dict) -> dict | None:
-    updates = parsed.get("updates", [])
-    query = parsed.get("query", "").strip()
-    target = parsed.get("target_memory", "").strip()
-    if not updates or not query or not target:
+# ---------------------------------------------------------------------------
+# Stage 3 多步生成（分段 API 调用，对标 LOCOMO ~500 轮对话规模）
+# ---------------------------------------------------------------------------
+
+# 每次生成参数随机范围
+_S3_N_SESSIONS_RANGE = (15, 20)  # 总 session 数
+_S3_TURNS_RANGE = (15, 25)       # 每个 session 的轮数
+_S3_MAX_CONTEXT_SIGNALS = 20     # 传给 cont call 的最近关键事件数
+
+
+def _fmt_entities(entities: list[str]) -> str:
+    return "\n".join(f"- {e}" for e in entities)
+
+
+def _fmt_key_events(signals: list[str], limit: int | None = None) -> str:
+    lst = signals[-limit:] if limit and len(signals) > limit else signals
+    return "\n".join(f"{i+1}. {e}" for i, e in enumerate(lst))
+
+
+def _parse_session_writes(data: dict) -> list[dict]:
+    """从 session API 响应中提取 writes 列表。"""
+    return [
+        w for w in data.get("writes", [])
+        if isinstance(w, dict) and w.get("content", "").strip()
+    ]
+
+
+def _generate_one_long_s3_sample(
+    backend: Any,
+    sys_prompt: str,
+    topic: str,
+    lang: str,
+    retry_limit: int,
+) -> dict | None:
+    """通过多步 API 调用生成一条长期记忆训练样本（~400-500 轮）。
+
+    流程：
+      Call 0 (init):  生成第 1 个 session + 引入实体列表
+      Call 1..N-1 (cont): 依次生成后续 session，传入前序关键事件做上下文
+      Call N (query):  基于全部关键事件生成 query + target_memory
+
+    任何一步失败返回 None（调用方可重试）。
+    """
+    n_sessions = random.randint(*_S3_N_SESSIONS_RANGE)
+    turns = random.randint(*_S3_TURNS_RANGE)
+
+    is_zh = (lang == "zh")
+
+    # ── Call 0: Init ──────────────────────────────────────────────────────────
+    init_prompt = (STAGE3_INIT_PROMPT_ZH if is_zh else STAGE3_INIT_PROMPT_EN).format(
+        topic=topic,
+        n_sessions=n_sessions,
+        turns=turns,
+    )
+    for attempt in range(retry_limit):
+        try:
+            raw = backend.generate(sys_prompt, init_prompt)
+            init_data = _extract_json(raw)
+            if init_data and init_data.get("writes") and init_data.get("entities"):
+                break
+            log.debug("S3 init parse fail (attempt %d)", attempt + 1)
+        except Exception as e:
+            log.warning("S3 init API error (attempt %d): %s", attempt + 1, e)
+            time.sleep(min(2 ** attempt, 30))
+    else:
         return None
 
+    entities: list[str] = init_data.get("entities", [])
+    all_sessions: list[dict] = [{"session_id": 1, "writes": _parse_session_writes(init_data)}]
+    # 追踪所有 signal 内容，用于 cont 和 query 调用
+    all_signals: list[str] = [
+        w["content"] for w in all_sessions[0]["writes"] if not w.get("is_noise")
+    ]
+
+    # ── Calls 1..N-1: Continuation ───────────────────────────────────────────
+    cont_tmpl = STAGE3_CONT_PROMPT_ZH if is_zh else STAGE3_CONT_PROMPT_EN
+    for sid in range(2, n_sessions + 1):
+        turns_this = random.randint(*_S3_TURNS_RANGE)
+        cont_prompt = cont_tmpl.format(
+            session_id=sid,
+            n_sessions=n_sessions,
+            entities_str=_fmt_entities(entities),
+            key_events_str=_fmt_key_events(all_signals, _S3_MAX_CONTEXT_SIGNALS),
+            turns=turns_this,
+        )
+        for attempt in range(retry_limit):
+            try:
+                raw = backend.generate(sys_prompt, cont_prompt)
+                sess_data = _extract_json(raw)
+                if sess_data and sess_data.get("writes"):
+                    break
+                log.debug("S3 cont sess %d parse fail (attempt %d)", sid, attempt + 1)
+            except Exception as e:
+                log.warning("S3 cont sess %d API error (attempt %d): %s", sid, attempt + 1, e)
+                time.sleep(min(2 ** attempt, 30))
+        else:
+            return None
+
+        writes = _parse_session_writes(sess_data)
+        all_sessions.append({"session_id": sid, "writes": writes})
+        all_signals.extend(w["content"] for w in writes if not w.get("is_noise"))
+
+    # ── Call N: Query + Target ────────────────────────────────────────────────
+    query_tmpl = STAGE3_QUERY_PROMPT_ZH if is_zh else STAGE3_QUERY_PROMPT_EN
+    query_prompt = query_tmpl.format(
+        entities_str=_fmt_entities(entities),
+        key_events_str=_fmt_key_events(all_signals, limit=50),
+        n_signals=len(all_signals),
+    )
+    for attempt in range(retry_limit):
+        try:
+            raw = backend.generate(sys_prompt, query_prompt)
+            qdata = _extract_json(raw)
+            if qdata and qdata.get("query") and qdata.get("target_memory"):
+                break
+            log.debug("S3 query parse fail (attempt %d)", attempt + 1)
+        except Exception as e:
+            log.warning("S3 query API error (attempt %d): %s", attempt + 1, e)
+            time.sleep(min(2 ** attempt, 30))
+    else:
+        return None
+
+    query = qdata["query"].strip()
+    target = qdata["target_memory"].strip()
+
+    # ── Flatten all sessions → history ────────────────────────────────────────
     history = []
-    for upd in updates:
-        time_label = upd.get("time_label", "")
-        signal = upd.get("signal", "").strip()
-        if signal:
-            history.append(_make_turn(signal, time_label=time_label, importance=1))
-        for n in upd.get("noise", []):
-            if isinstance(n, str):
-                text = n.strip()
-            elif isinstance(n, dict):
-                text = (n.get("content") or n.get("text") or "").strip()
-            else:
-                text = ""
-            if text:
-                history.append(_make_turn(text, time_label=time_label, importance=0))
+    for sess in all_sessions:
+        for w in sess["writes"]:
+            content = w.get("content", "").strip()
+            if content:
+                history.append(_make_turn(content, time_label="", importance=0 if w.get("is_noise") else 1))
 
-    if not history:
-        return None
     return {"history": history, "query": query, "target_memory": target, "source": "memory_v2_s3"}
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 自博弈验证（LLM-as-Judge）
+# ---------------------------------------------------------------------------
+
+_S3_JUDGE_SYS_ZH = "你是一位严格的记忆训练数据验证专家，负责评估数据质量是否满足长期记忆训练要求。"
+_S3_JUDGE_SYS_EN = "You are a strict quality validator for long-term memory training data."
+
+_S3_JUDGE_USER_ZH = """请验证以下记忆训练数据是否合格。
+
+【数据统计】
+总轮次：{n_turns}（重要={n_important}，噪音={n_noise}）
+
+【前15条内容】
+{first_turns}
+
+【后15条内容】
+{last_turns}
+
+【Query】
+{query}
+
+【Target Memory（前300字）】
+{target_preview}
+
+【验证标准】（全部满足才通过）
+1. 总轮次 ≥ 100
+2. 每条内容具体自然，无省略号占位符（"..."）
+3. 重要记录（is_noise=false）包含具体可记忆的信息
+4. 后期内容有对早期事件的引用或状态更新（前后记忆对照）
+5. 至少2个实体有跨轮次的明显状态变化
+6. query 需综合多轮信息才能回答（不能只看1条记录）
+7. target_memory 准确综合了相关背景，不是直接回答问题
+
+只输出JSON，不要任何解释：{{"pass": true, "reason": "ok"}} 或 {{"pass": false, "reason": "具体不通过的原因"}}"""
+
+_S3_JUDGE_USER_EN = """Validate the following memory training data.
+
+[Statistics]
+Total turns: {n_turns} (important={n_important}, noise={n_noise})
+
+[First 15 entries]
+{first_turns}
+
+[Last 15 entries]
+{last_turns}
+
+[Query]
+{query}
+
+[Target Memory (first 300 chars)]
+{target_preview}
+
+[Validation criteria] (ALL must pass)
+1. Total turns ≥ 100
+2. Each entry is specific and natural, no ellipsis placeholders ("...")
+3. Important entries (is_noise=false) contain concrete memorable facts
+4. Later entries reference or update earlier events (cross-session callbacks)
+5. At least 2 entities show clear state changes across turns
+6. Query requires synthesizing info from multiple turns (not answerable from 1 entry)
+7. Target memory accurately synthesizes relevant background, not a direct answer
+
+Output JSON only: {{"pass": true, "reason": "ok"}} or {{"pass": false, "reason": "specific reason"}}"""
+
+
+def _judge_stage3_sample(backend: Any, sample: dict, lang: str) -> bool:
+    """自博弈验证：用 LLM 扮演验证师评估 stage3 样本质量。
+
+    只传统计信息 + 首尾各 15 条（避免传入超大 context），验证 API 调用 max_tokens=150。
+    验证 API 异常时默认放行，避免阻塞生成。
+    """
+    h = sample.get("history", [])
+    n_turns = len(h)
+    n_important = sum(1 for t in h if t.get("importance", 0) == 1)
+    n_noise = n_turns - n_important
+
+    first_turns = "\n".join(t.get("content", "") for t in h[:15])
+    last_turns = "\n".join(t.get("content", "") for t in h[-15:])
+
+    is_zh = (lang == "zh")
+    judge_sys = _S3_JUDGE_SYS_ZH if is_zh else _S3_JUDGE_SYS_EN
+    judge_user = (_S3_JUDGE_USER_ZH if is_zh else _S3_JUDGE_USER_EN).format(
+        n_turns=n_turns,
+        n_important=n_important,
+        n_noise=n_noise,
+        first_turns=first_turns,
+        last_turns=last_turns,
+        query=sample.get("query", "")[:300],
+        target_preview=sample.get("target_memory", "")[:300],
+    )
+
+    try:
+        raw = backend.generate(judge_sys, judge_user, max_new_tokens=150)
+        if not raw:
+            log.warning("S3 judge returned empty response (content filter?) — accepting sample")
+            return True
+        result = _extract_json(raw)
+        if result is not None:
+            passed = bool(result.get("pass", False))
+            reason = result.get("reason", "")
+            if not passed:
+                log.warning("S3 judge REJECT: %s", reason)
+            return passed
+        log.warning("S3 judge response not parseable — accepting sample: %s", raw[:200])
+        return True  # 无法解析时放行，避免阻塞生成
+    except Exception as e:
+        log.warning("S3 judge API error: %s — accepting sample", e)
+        return True  # 验证异常时放行
 
 
 # ---------------------------------------------------------------------------
@@ -601,8 +907,11 @@ _ASSISTANT_REPLY_WORDS_EN = ("you should", "you need to", "I recommend that you"
 
 # Stage 1: 单轮对话，target 是单条记忆摘要，短。
 # Stage 2: 多 session 积累，target 合并多条记忆，最长。
-# Stage 3: 实体更新精调，target 描述"变更后的新事实"，比 stage2 精简。
-_TARGET_MAX_LEN = {1: 300, 2: 800, 3: 600}
+# Stage 3: 长期多实体整合（LOCOMO 对标），target 综合多 session，允许更长。
+_TARGET_MAX_LEN = {1: 300, 2: 800, 3: 1000}
+
+# Stage 3 最少轮数（目标 225-500 轮，100轮是最低线，过滤严重退化输出）
+_STAGE3_MIN_TURNS = 100
 
 
 def _validate_sample(sample: dict, lang: str = "zh", stage: int = 1) -> tuple[bool, str]:
@@ -611,8 +920,9 @@ def _validate_sample(sample: dict, lang: str = "zh", stage: int = 1) -> tuple[bo
     q = sample.get("query", "")
     t = sample.get("target_memory", "")
 
-    if len(h) < 3:
-        return False, f"too few writes: {len(h)}"
+    min_turns = _STAGE3_MIN_TURNS if stage == 3 else 3
+    if len(h) < min_turns:
+        return False, f"too few writes: {len(h)} (min={min_turns})"
     if len(q) < 5:
         return False, "query too short"
     if len(t) < 10:
@@ -719,11 +1029,12 @@ class OpenAIBackend:
             kwargs["base_url"] = base_url
         if api_key:
             kwargs["api_key"] = api_key
-        self.client = openai.OpenAI(**kwargs)
+        self.client = openai.OpenAI(**kwargs, timeout=3600)
         self.model = model
 
     def generate(self, system: str, user: str, max_new_tokens: int = 2048) -> str:
-        resp = self.client.chat.completions.create(
+        # 用 streaming 模式：代理持续收到 token 就不会因空闲而 504
+        chunks = self.client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": system},
@@ -731,8 +1042,16 @@ class OpenAIBackend:
             ],
             max_tokens=max_new_tokens,
             temperature=0.85,
+            stream=True,
         )
-        return resp.choices[0].message.content
+        content = ""
+        for chunk in chunks:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta.content
+            if delta:
+                content += delta
+        return content
 
 
 # ---------------------------------------------------------------------------
@@ -751,35 +1070,35 @@ def _get_system_prompt(lang: str) -> str:
     return base
 
 
+def _pick_topic(lang: str) -> str:
+    """随机选择一个话题（Stage 3 多步生成直接调用）。"""
+    return random.choice(ALL_TOPICS if lang == "zh" else ALL_TOPICS_EN)
+
+
 def _build_prompt(stage: int, lang: str = "zh") -> str:
+    """Stage 1/2 返回格式化 prompt 字符串。Stage 3 不使用此函数（见 try_one）。"""
     if lang == "zh":
-        # 中文：用中文 prompt 模板
         topic = random.choice(ALL_TOPICS)
         if stage == 1:
             return STAGE1_PROMPT.format(topic=topic)
-        elif stage == 2:
+        else:  # stage == 2
             span_label, n_sess = random.choice(TIME_SPANS)
             qtype = random.choice(QUERY_TYPES)
             return STAGE2_PROMPT.format(
                 topic=topic, time_span=span_label,
                 n_sessions=n_sess, query_type=qtype,
             )
-        else:
-            return STAGE3_PROMPT.format(topic=topic)
     else:
-        # EN 及其他所有语言：用 EN prompt 模板（语言要求由 system prompt 指定）
         topic = random.choice(ALL_TOPICS_EN)
         if stage == 1:
             return STAGE1_PROMPT_EN.format(topic=topic)
-        elif stage == 2:
+        else:  # stage == 2
             span_label, n_sess = random.choice(TIME_SPANS_EN)
             qtype = random.choice(QUERY_TYPES_EN)
             return STAGE2_PROMPT_EN.format(
                 topic=topic, time_span=span_label,
                 n_sessions=n_sess, query_type=qtype,
             )
-        else:
-            return STAGE3_PROMPT_EN.format(topic=topic)
 
 
 def _parse_and_convert(text: str, stage: int) -> dict | None:
@@ -791,7 +1110,7 @@ def _parse_and_convert(text: str, stage: int) -> dict | None:
     elif stage == 2:
         return _stage2_to_sample(parsed)
     else:
-        return _stage3_to_sample(parsed)
+        raise ValueError(f"_parse_and_convert called with stage={stage}; stage 3 uses multi-step pipeline")
 
 
 def _count_existing(path: Path) -> int:
@@ -830,20 +1149,44 @@ def _generate_samples_concurrent(
     sys_prompt = _get_system_prompt(lang)
 
     def try_one() -> dict | None:
-        """一次 API 调用，最多 retry_limit 次。解析失败或 validate 失败均重试。"""
+        """生成并验证一条样本。
+
+        Stage 3：走多步流水线（INIT→CONT×N→QUERY），每步 retry 在
+                 _generate_one_long_s3_sample() 内部处理，此处仅做外层验证。
+        Stage 1/2：单次 API 调用 + 解析 + 验证，最多 retry_limit 次。
+        """
+        if stage == 3:
+            topic = _pick_topic(lang)
+            sample = _generate_one_long_s3_sample(backend, sys_prompt, topic, lang, retry_limit)
+            if sample is None:
+                return None
+            valid, reason = _validate_sample(sample, lang, stage)
+            if not valid:
+                log.warning("Stage3 validate failed: %s | turns=%d",
+                            reason, len(sample.get("history", [])))
+                return None
+            if not _judge_stage3_sample(backend, sample, lang):
+                log.warning("Stage3 judge rejected | turns=%d", len(sample.get("history", [])))
+                return None
+            return sample
+
+        # Stage 1/2: single API call
         prompt = _build_prompt(stage, lang)
         for retry in range(retry_limit):
             try:
-                raw = backend.generate(sys_prompt, prompt)
+                raw = backend.generate(sys_prompt, prompt, max_new_tokens=2048)
                 sample = _parse_and_convert(raw, stage)
                 if sample is None:
-                    log.debug("Parse failed (retry %d/%d)", retry + 1, retry_limit)
+                    log.warning("Parse failed (retry %d/%d) — first 500 chars: %s",
+                                retry + 1, retry_limit, raw[:500].replace("\n", "\\n"))
                     continue
                 valid, reason = _validate_sample(sample, lang, stage)
-                if valid:
-                    return sample
-                log.debug("Validate failed (retry %d/%d): %s", retry + 1, retry_limit, reason)
-                # validate 失败说明模型输出质量差，重新生成而不是直接放弃
+                if not valid:
+                    log.warning("Validate failed (retry %d/%d): %s | turns=%d",
+                                retry + 1, retry_limit, reason,
+                                len(sample.get("history", [])))
+                    continue
+                return sample
             except Exception as e:
                 wait = min(2 ** retry, 30)
                 log.warning("API error (retry %d/%d): %s — wait %ds", retry + 1, retry_limit, e, wait)
@@ -866,12 +1209,7 @@ def _generate_samples_concurrent(
             _fill()
 
             while count < remaining:
-                done = {fut for fut in pending if fut.done()}
-                if not done:
-                    time.sleep(0.05)
-                    continue
-
-                pending -= done
+                done, pending = futures_wait(pending, return_when=FIRST_COMPLETED)
                 for fut in done:
                     if count >= remaining:
                         break
@@ -927,6 +1265,7 @@ def generate_samples(
     rejected = 0    # 本次拒绝
     consecutive_failures = 0
 
+    sys_prompt = _get_system_prompt(lang)
     with output_path.open("a", encoding="utf-8") as f:
         while count < remaining:
             if consecutive_failures >= max_consecutive_failures:
@@ -936,20 +1275,23 @@ def generate_samples(
                 )
                 break
 
-            prompt = _build_prompt(stage, lang)
-            sys_prompt = _get_system_prompt(lang)
-            sample = None
-
-            for retry in range(retry_limit):
-                try:
-                    raw = backend.generate(sys_prompt, prompt)
-                    sample = _parse_and_convert(raw, stage)
-                    if sample is not None:
-                        break
-                    log.debug("Parse failed (retry %d), raw[:120]: %s", retry + 1, raw[:120])
-                except Exception as e:
-                    log.warning("Generation error (retry %d/%d): %s", retry + 1, retry_limit, e)
-                    time.sleep(2 ** retry)
+            # Stage 3: 多步流水线（INIT→CONT×N→QUERY），不走单次调用
+            if stage == 3:
+                topic = _pick_topic(lang)
+                sample = _generate_one_long_s3_sample(backend, sys_prompt, topic, lang, retry_limit)
+            else:
+                prompt = _build_prompt(stage, lang)
+                sample = None
+                for retry in range(retry_limit):
+                    try:
+                        raw = backend.generate(sys_prompt, prompt)
+                        sample = _parse_and_convert(raw, stage)
+                        if sample is not None:
+                            break
+                        log.debug("Parse failed (retry %d), raw[:120]: %s", retry + 1, raw[:120])
+                    except Exception as e:
+                        log.warning("Generation error (retry %d/%d): %s", retry + 1, retry_limit, e)
+                        time.sleep(2 ** retry)
 
             if sample is None:
                 rejected += 1
@@ -961,6 +1303,12 @@ def generate_samples(
                 rejected += 1
                 consecutive_failures += 1
                 log.debug("Sample rejected: %s", reason)
+                continue
+
+            if stage == 3 and not _judge_stage3_sample(backend, sample, lang):
+                rejected += 1
+                consecutive_failures += 1
+                log.warning("Stage3 judge rejected | turns=%d", len(sample.get("history", [])))
                 continue
 
             f.write(json.dumps(sample, ensure_ascii=False) + "\n")
@@ -1093,7 +1441,7 @@ def main() -> None:
              count, rejected, 100.0 * rejected / max(count + rejected, 1))
 
     # 自动验证
-    validate_file(output_path, lang=args.lang)
+    validate_file(output_path, lang=args.lang, stage=args.stage)
 
 
 if __name__ == "__main__":

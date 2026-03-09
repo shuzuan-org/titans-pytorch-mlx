@@ -146,6 +146,107 @@ memory 不能 checkpoint（有状态），所以不能让 FSDP 统一管理 acti
 
 ---
 
+## NLM 工作原理：为什么能"记住"
+
+### 写入：推理时梯度下降（test-time learning）
+
+NLM 的核心创新：**MemoryMLP 的权重本身就是记忆载体**，推理时通过梯度更新改写权重。
+
+每处理一段输入 token，NLM 执行：
+```
+1. x → proj_k → keys,  x → proj_v → values
+2. 计算关联记忆损失：loss = ||M(k) - v||²
+   （"如果输入 k，你能输出 v 吗？"）
+3. 对 MemoryMLP 权重求梯度：grads = ∂loss/∂W
+4. 带动量的权重更新：
+   S_t = η·S_{t-1} - θ·grads    ← momentum
+   M_t = (1-α)·M_{t-1} + S_t   ← weight decay（遗忘）
+```
+
+关键：这发生在 `torch.enable_grad()` 上下文中，**与主训练的反传完全独立**。
+MemoryMLP 权重通过 `set_weights()` 直接改 `.data`，不进 optimizer。
+
+### 读取：正向传播
+
+```
+q = proj_q(x) → SiLU → L2_normalize
+output = proj_out(MemoryMLP(q))
+```
+
+MemoryMLP 的权重里已经存着之前写入的 k→v 关联，输入语义相近的 q 能召回对应的 v。
+
+### 三个门控：数据依赖的学习率
+
+```python
+alpha = gate_decay(x)    # α：遗忘率 — 此刻忘多少旧的
+theta = gate_lr(x)       # θ：学习率 — 此 token 写入深度
+eta   = gate_momentum(x) # η：动量系数 — 延续多少上次"惊讶"
+```
+
+每个 token 自己决定写入强度，不是全局固定超参。
+**当前实现简化**：将 (B, S, D) 的门控值 `.mean(dim=(0,1))` 聚合为 (D,) 的 per-dim 标量，
+论文是 per-token per-dim 的顺序更新（每个 token 独立 S_t），理论上表达能力更强。
+
+### 为什么还需要 LoRA
+
+| 组件 | 更新时机 | 作用 |
+|------|---------|------|
+| MemoryMLP 权重 | 推理时（每个 chunk）| 存储/检索信息 |
+| LoRA（Attn + FFN）| 训练时（监督学习）| 学会使用 NLM 输出 |
+| Qwen3.5 base | 冻结 | 语言理解/生成能力 |
+
+NLM 插在每个 decoder layer 前（MAL 风格）：
+```
+x → NLM → x + mem_out → Attention → FFN
+```
+
+原始 Qwen3.5 从未见过 `mem_out` 信号。没有 LoRA，Attention/FFN 无法辨别 NLM 输出中
+有用的信息，会把它当噪声忽略。Titans Revisited 独立验证了这一点（2025-10）：
+
+> "Without joint adaptation, new information integration is limited."
+
+---
+
+## NLM 有效性实测结论（2026-03-08）
+
+### 实验：oracle.read() recall 来源分离
+
+三路对比（固定 KV cache 内容，改变 NLM state）：
+
+| 条件 | 正确数 | 解释 |
+|------|-------|------|
+| KV cache + NLM updated | 2/5 | baseline |
+| KV cache only（NLM reset）| 2/5 | NLM 贡献 = 0 |
+| 无 KV cache，NLM updated | 0/5 | NLM 单独 = 0 |
+
+**结论**：当前 recall 完全来自 KV cache，NLM weights 贡献为零。
+
+### 根因：4 层叠加失效
+
+1. **init_state std=1e-6 → NLM 输出量级 ~1e-6，hidden state ~0.1**
+   差 5 个数量级，训练期间模型"看不见"NLM，直接学会绕开。
+
+2. **梯度极小（mean ~4e-5）**
+   k 经 L2_normalize 每元素 ~0.014；MSE mean reduction 除以 N×D → 梯度极小；
+   momentum 不足以积累到可见的权重变化。
+
+3. **Batch 更新 ≠ 论文 per-token 顺序更新**
+   整序列一次 batch step，decay 项 (1-α) 主导，权重反而**缩小至初始值的 0.28×**。
+
+4. **门控 meta-params 从未训练**
+   `gate_lr / gate_decay / gate_momentum` 的 `requires_grad=False`（固定在 sigmoid(0)=0.5）；
+   学习率、遗忘率、动量均无法根据任务自适应。
+
+### 可能出路
+
+| 方向 | 代价 | 状态 |
+|------|------|------|
+| per-token 顺序更新 + 解冻 meta-params + init std↑ | 需重设计训练流程，NLM 循环慢 N× | 待评估 |
+| `create_graph=True`（MAML 风格）使 meta-params 可微 | 3-5× 内存 | 待评估 |
+| 改用外挂 KV store（接受结构性限制） | 放弃权重内化目标 | 待决策 |
+
+---
+
 ## 可选优化模块
 
 | 模块 | 功能 | 状态 |

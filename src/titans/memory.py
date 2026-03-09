@@ -175,7 +175,9 @@ class MemoryMLP(nn.Module):
             Scalar loss value
         """
         predictions = self.forward(keys)
-        return F.mse_loss(predictions, values, reduction="mean")
+        # mean over D (feature dim), sum over batch×seq — prevents N×D deflation
+        # that made gradients ~1e-5 with pure "mean" reduction.
+        return ((predictions - values) ** 2).mean(dim=-1).sum()
 
 
 class NeuralLongTermMemory(nn.Module):
@@ -286,9 +288,10 @@ class NeuralLongTermMemory(nn.Module):
         This computes the gradient of the associative memory loss
         with respect to the memory weights.
 
-        Uses optimized gradient computation when available:
-        - Analytical gradients for single-layer memory (CUDA)
-        - Fallback to autograd
+        Priority:
+        1. Analytical closed-form for single-layer linear memory (fastest, no autograd)
+        2. CUDA extension (if available)
+        3. torch.autograd.grad fallback (multi-layer memory)
 
         Args:
             keys: Key vectors (batch, seq, dim)
@@ -297,7 +300,20 @@ class NeuralLongTermMemory(nn.Module):
         Returns:
             List of gradient tensors for each memory layer
         """
-        # Try optimized gradient computation first
+        # Fast path: single-layer linear memory has a closed-form gradient.
+        # loss = mean_D(||W @ k - v||^2).sum_batch
+        # grad_W = (2/D_out) * error.T @ k
+        # This replaces torch.autograd.grad with two matrix multiplications,
+        # eliminating Python autograd overhead (~50x faster per token).
+        if len(self.memory.layers) == 1:
+            k = keys.detach().reshape(-1, keys.shape[-1])    # (B*T, D_in)
+            v = values.detach().reshape(-1, values.shape[-1]) # (B*T, D_out)
+            W = self.memory.layers[0].weight.data             # (D_out, D_in)
+            error = k @ W.T - v                               # (B*T, D_out)
+            grad_W = (2.0 / error.shape[-1]) * error.T @ k   # (D_out, D_in)
+            return [grad_W]
+
+        # CUDA extension for multi-layer memory (if compiled)
         if HAS_CUDA_OPTIMIZATIONS and keys.is_cuda:
             try:
                 weights = [layer.weight.data for layer in self.memory.layers]
@@ -312,8 +328,8 @@ class NeuralLongTermMemory(nn.Module):
                     "CUDA gradient optimization failed (%s), falling back to autograd", e
                 )
 
-        # Use torch.enable_grad() to compute gradients even in inference mode
-        # This is essential because Titans learns at test time
+        # Autograd fallback for multi-layer memory.
+        # This is essential because Titans learns at test time (inference mode).
         with torch.enable_grad():
             try:
                 for param in self.memory.parameters():
@@ -341,12 +357,12 @@ class NeuralLongTermMemory(nn.Module):
     def init_state(self) -> MemoryState:
         """Initialize memory state for an empty (un-written) memory.
 
-        Weights are initialised with tiny noise (std=1e-6) rather than exact
+        Weights are initialised with tiny noise (std=0.01) rather than exact
         zeros. This is necessary for multi-layer memory: with zero weights,
         SiLU(W1 @ k) = SiLU(0) = 0, which kills gradients through W2 and W1
         via the chain rule, making the first write a no-op. Tiny noise keeps
-        gradients alive while keeping retrieval output negligibly small
-        (≪ 1e-10 for typical inputs), satisfying the "empty memory" semantic.
+        gradients alive while keeping retrieval output small at init,
+        satisfying the "empty memory" semantic.
 
         For single-layer linear memory, zero weights do not cause dead
         gradients (no activation between input and weight), but we use the
@@ -358,7 +374,7 @@ class NeuralLongTermMemory(nn.Module):
         Returns:
             Initial memory state
         """
-        weights  = [torch.empty_like(l.weight.data).normal_(std=1e-6)
+        weights  = [torch.empty_like(l.weight.data).normal_(std=0.01)
                     for l in self.memory.layers]
         momentum = [torch.zeros_like(l.weight.data) for l in self.memory.layers]
         return MemoryState(weights=weights, momentum=momentum)
@@ -413,26 +429,36 @@ class NeuralLongTermMemory(nn.Module):
         v = F.silu(v)
 
         # Compute data-dependent gates per token (batch, seq, dim)
-        alpha = self.gate_decay(x) * self.config.memory_decay      # per-token decay
-        theta = self.gate_lr(x) * self.config.memory_lr            # per-token lr
-        eta = self.gate_momentum(x) * self.config.memory_momentum  # per-token momentum
+        alpha = self.gate_decay(x) * self.config.memory_decay      # (B, T, D) decay
+        theta = self.gate_lr(x) * self.config.memory_lr            # (B, T, D) lr
+        eta = self.gate_momentum(x) * self.config.memory_momentum  # (B, T, D) momentum
 
-        # Aggregate over batch+seq, keep dim → (D,) per-output-dim gates.
-        # Better than a single scalar, but still a token-averaged approximation
-        # of the paper's sequential per-token update (α_t, θ_t, η_t per token).
-        alpha_d = alpha.mean(dim=(0, 1))   # (batch, seq, D) → (D,)
-        theta_d = theta.mean(dim=(0, 1))
-        eta_d = eta.mean(dim=(0, 1))
-
-        # Update memory with new key-value pairs
-        grads = self._compute_gradients(k, v)
-
-        # Per-dim (D,) gates require _broadcast_gate() for correct shape handling.
-        # TODO: update batched_memory_update kernel to support (D,) per-dim gates.
-        # Until then, always use _standard_memory_update.
-        new_weights, new_momentum = self._standard_memory_update(
-            state.weights, state.momentum, grads, alpha_d, eta_d, theta_d
-        )
+        # Per-token sequential update — faithful to the Titans paper.
+        # Each token t updates W using only (k_t, v_t, alpha_t, theta_t, eta_t),
+        # so causality is preserved: W_t depends only on tokens 0..t.
+        # The batch dim is averaged for gate scalars (approximation for B>1).
+        #
+        # Complexity: O(T) autograd calls (one torch.autograd.grad per token).
+        # For single-layer linear memory this can be replaced with a closed-form
+        # outer-product accumulation, eliminating the loop entirely — see the
+        # CUDA path in _compute_gradients. Python loop is the correct fallback
+        # for multi-layer memory where no analytical form exists.
+        # At T=2048 with 28 layers this is ~57K backward passes per forward;
+        # keep seq_len short (≤256) until the CUDA optimized path is wired up.
+        weights = [w.clone() for w in state.weights]
+        momentum_s = [m.clone() for m in state.momentum]
+        T = k.shape[1]
+        for t in range(T):
+            alpha_t = alpha[:, t, :].mean(0)   # (D,)
+            theta_t = theta[:, t, :].mean(0)
+            eta_t   = eta[:, t, :].mean(0)
+            grads_t = self._compute_gradients(
+                k[:, t : t + 1, :], v[:, t : t + 1, :]
+            )
+            weights, momentum_s = self._standard_memory_update(
+                weights, momentum_s, grads_t, alpha_t, eta_t, theta_t
+            )
+        new_weights, new_momentum = weights, momentum_s
 
         return output, MemoryState(weights=new_weights, momentum=new_momentum).detach()
 

@@ -204,8 +204,17 @@ def generate_stage_data(
         if use_api:
             n_workers = args.gen_api_workers
             per_worker = math.ceil(n_total / n_workers)
+
+            # 按任务量比例分配并发：--gen-total-concurrency 指定总预算
+            if args.gen_total_concurrency > 0:
+                total_needed = sum(n for _, n in tasks)
+                lang_share = n_total / total_needed if total_needed > 0 else 1 / len(tasks)
+                lang_conc = max(5, round(args.gen_total_concurrency * lang_share / n_workers))
+            else:
+                lang_conc = args.gen_concurrency
+
             log.info("  %s: 补充 %d 条 → %d workers × %d samples (concurrency=%d/worker)",
-                     lang, n_total, n_workers, per_worker, args.gen_concurrency)
+                     lang, n_total, n_workers, per_worker, lang_conc)
             for i in range(n_workers):
                 part_path = out_dir / f"stage{stage}_gen{i}.jsonl"
                 log_path = Path(args.log_dir) / f"build_{lang}_s{stage}_w{i}.log"
@@ -220,7 +229,7 @@ def generate_stage_data(
                     "--openai-model", args.gen_model,
                     "--openai-base-url", args.gen_base_url,
                     "--openai-api-key", args.gen_api_key,
-                    "--concurrency", str(args.gen_concurrency),
+                    "--concurrency", str(lang_conc),
                 ]
                 log_file = open(log_path, "w")
                 proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
@@ -431,6 +440,8 @@ def parse_args() -> argparse.Namespace:
                    help="Python 解释器路径（默认与当前进程相同）")
     p.add_argument("--samples-per-worker", type=int, default=1000,
                    help="每个生成 worker 的目标样本数（影响并发数，local backend 有效）")
+    p.add_argument("--no-train", action="store_true",
+                   help="只生成数据，跳过训练（用于单独补充数据）")
     p.add_argument("--no-generate", action="store_true",
                    help="跳过数据生成，直接等待（兼容旧行为：外部手动生成数据）")
     # 生成 backend：stage1 用 local，stage2/3 必须用 api
@@ -444,7 +455,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gen-model", default="MiniMax-Text-01",
                    help="API 生成模型名")
     p.add_argument("--gen-concurrency", type=int, default=10,
-                   help="每个 worker 进程的并发 API 请求数")
+                   help="每个 worker 进程的并发 API 请求数（与 --gen-total-concurrency 互斥）")
+    p.add_argument("--gen-total-concurrency", type=int, default=0,
+                   help="API 并发总预算（>0 时按各语言剩余任务量比例自动分配，忽略 --gen-concurrency）")
     p.add_argument("--gen-api-workers", type=int, default=3,
                    help="api backend 下每种语言的 worker 进程数")
     # 评测参数（stage3 完成后自动运行 LoCoMo 评测）
@@ -479,6 +492,11 @@ def main() -> None:
     log.info("阶段: %s", args.stages)
     log.info("Checkpoint: %s", ckpt_root)
 
+    import threading
+
+    bg_gen_thread: threading.Thread | None = None
+    bg_gen_exc: list[BaseException] = []
+
     for stage in sorted(args.stages):
         # 数据准备：自动生成（默认）或外部等待（--no-generate）
         if args.no_generate:
@@ -498,8 +516,33 @@ def main() -> None:
                 f"当前: { {l: counts[l] for l in langs if counts[l] < TARGETS[l][stage-1] * READY_RATIO} }"
             )
 
+        # 与本阶段训练并行，提前生成下一阶段数据（API 生成不占 GPU）
+        next_stage = stage + 1
+        if not args.no_generate and next_stage in args.stages:
+            def _bg_gen(s: int) -> None:
+                try:
+                    generate_stage_data(s, data_root, langs, args)
+                except BaseException as e:
+                    bg_gen_exc.append(e)
+            bg_gen_thread = threading.Thread(
+                target=_bg_gen, args=(next_stage,),
+                name=f"bg-gen-stage{next_stage}", daemon=True,
+            )
+            bg_gen_thread.start()
+            log.info("后台启动 Stage %d 数据生成（与 Stage %d 训练并行）", next_stage, stage)
+
         # 启动训练
-        run_stage(stage, data_root, ckpt_root, langs, args)
+        if not args.no_train:
+            run_stage(stage, data_root, ckpt_root, langs, args)
+
+        # 训练结束后确保后台生成也完成
+        if bg_gen_thread is not None:
+            log.info("等待后台 Stage %d 数据生成完成...", next_stage)
+            bg_gen_thread.join()
+            bg_gen_thread = None
+            if bg_gen_exc:
+                raise RuntimeError(f"后台 Stage {next_stage} 数据生成失败: {bg_gen_exc[0]}") from bg_gen_exc[0]
+            log.info("后台 Stage %d 数据生成完成", next_stage)
 
     log.info("=== 全流水线完成 ===")
     log.info("最终 Checkpoint: %s/stage3/final", ckpt_root)

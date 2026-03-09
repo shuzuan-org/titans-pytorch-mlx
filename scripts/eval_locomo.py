@@ -333,9 +333,9 @@ def eval_with_oracle(
             memory_summary = oracle.read(question)
 
             answer_prompt = (
-                f"背景记忆：{memory_summary}\n\n"
-                f"请根据以上记忆回答问题（简洁准确，不超过50字）：\n"
-                f"问题：{question}\n答案："
+                f"Memory context: {memory_summary}\n\n"
+                f"Answer the question concisely (under 20 words) based on the memory above.\n"
+                f"Question: {question}\nAnswer:"
             )
             # oracle.read() 已经调用了 unfreeze，_generate_answer 在写入模式下运行；
             # 为了不让答案生成污染 NLM，在 generate 前后显式 freeze/unfreeze。

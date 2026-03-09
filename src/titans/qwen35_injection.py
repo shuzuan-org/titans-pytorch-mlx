@@ -63,8 +63,10 @@ class Qwen35LayerWithMemory(nn.Module):
         self.layer_idx: int = layer_idx  # stable identity for state save/load
         # State for this layer; reset per-sequence
         self.memory_state: MemoryState | None = None
-        # When True: retrieval only, no weight update
+        # When True: retrieval only, no weight update (inference guard)
         self._nlm_frozen: bool = False
+        # When True: retrieval only, no weight update (E_C ablation — training)
+        self._nlm_write_disabled: bool = False
 
     # ------------------------------------------------------------------
     # Attribute delegation
@@ -115,6 +117,17 @@ class Qwen35LayerWithMemory(nn.Module):
                 self.memory_state = self.memory.init_state()
             # retrieve() applies proj_q + memory.forward() + proj_out
             mem_out = self.memory.retrieve(hidden_states, self.memory_state)
+        elif self._nlm_write_disabled:
+            # E_C ablation: NLM as static transform, no memory write.
+            # State initialised once and never updated; only proj_q / memory.W /
+            # proj_out participate in the forward graph (proj_k/v, gates are dead).
+            if self.memory_state is None:
+                self.memory_state = self.memory.init_state()
+            mem_out, _ = self.memory(
+                hidden_states,
+                state=self.memory_state,
+                update_memory=False,
+            )
         else:
             # Normal: retrieve AND update state
             mem_out, self.memory_state = self.memory(
@@ -229,6 +242,18 @@ def unfreeze_memory_updates(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, Qwen35LayerWithMemory):
             module._nlm_frozen = False
+
+
+def disable_memory_write(model: nn.Module) -> None:
+    """E_C ablation: disable memory write for all NLM layers.
+
+    NLM layers still participate in the forward pass (proj_q → memory.W →
+    proj_out) but never update the memory state.  This isolates the capacity
+    contribution of the NLM weights from the write mechanism.
+    """
+    for module in model.modules():
+        if isinstance(module, Qwen35LayerWithMemory):
+            module._nlm_write_disabled = True
 
 
 # ---------------------------------------------------------------------------

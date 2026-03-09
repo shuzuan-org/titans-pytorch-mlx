@@ -8,12 +8,11 @@ Memory Oracle 三阶段训练脚本。
 模型：Qwen3.5-0.8B + NLM(num_memory_layers=1) + LoRA r=16
 
 训练数据格式（JSONL，由 build_memory_data_v2.py 生成）：
-  {"history": [{"role": "write", "content": "...", "importance": 0|1},...],
+  {"history": [{"role": "write", "content": "...", "importance": 0|1}, ...],
    "query": "...",
    "target_memory": "..."}
 
-  数据由 MiniMax API 合成，12 语种（zh/en/ja/ko/fr/es/de/ar/ru/pt/it/vi）。
-  每条 turn 内嵌 importance 字段（1=重要信息，0=噪音），Stage 3 的 importance loss 直接使用。
+  importance 字段内嵌于每个 history turn（1=重要信息，0=噪音），Stage 3 importance loss 直接使用。
 
 训练策略：
   每个样本格式化为一条对话序列：
@@ -68,6 +67,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from titans.config import TitansConfig
 from titans.qwen35_injection import (
+    disable_memory_write,
     get_trainable_params,
     inject_memory_into_qwen35,
     reset_memory_states,
@@ -371,10 +371,9 @@ def build_model(
     if resume_dir is not None and resume_dir.is_dir() and (resume_dir / "config.json").exists():
         # resume_dir 是 peft 格式的 final/ 目录，基模型用 adapter_config 里的 base_model_name_or_path
         try:
-            import json as _json
             adapter_cfg_path = resume_dir / "adapter_config.json"
             if adapter_cfg_path.exists():
-                adapter_cfg = _json.loads(adapter_cfg_path.read_text())
+                adapter_cfg = json.loads(adapter_cfg_path.read_text())
                 model_src = adapter_cfg.get("base_model_name_or_path", args.model)
                 log.info("Resume: using base model %s from adapter_config", model_src)
         except Exception as e:
@@ -389,23 +388,29 @@ def build_model(
     )
 
     # ------------------------------------------------------------------
-    # NLM 注入
+    # NLM 注入（可通过 --no-nlm 跳过，用于 ablation E_A）
     # ------------------------------------------------------------------
     # Qwen3.5 multimodal: hidden_size lives in text_config
-    if hasattr(model.config, "text_config"):
-        model_dim: int = model.config.text_config.hidden_size
+    if args.no_nlm:
+        log.info("--no-nlm: NLM injection skipped (LoRA-only ablation)")
     else:
-        model_dim: int = model.config.hidden_size
-    mem_cfg = TitansConfig(
-        dim=model_dim,
-        num_memory_layers=args.num_memory_layers,
-        memory_lr=args.memory_lr,
-        memory_momentum=args.memory_momentum,
-        memory_decay=args.memory_decay,
-        use_conv=False,
-    )
-    log.info("Injecting NLM (dim=%d, num_memory_layers=%d)", model_dim, args.num_memory_layers)
-    inject_memory_into_qwen35(model, mem_cfg)
+        if hasattr(model.config, "text_config"):
+            model_dim: int = model.config.text_config.hidden_size
+        else:
+            model_dim: int = model.config.hidden_size
+        mem_cfg = TitansConfig(
+            dim=model_dim,
+            num_memory_layers=args.num_memory_layers,
+            memory_lr=args.memory_lr,
+            memory_momentum=args.memory_momentum,
+            memory_decay=args.memory_decay,
+            use_conv=False,
+        )
+        log.info("Injecting NLM (dim=%d, num_memory_layers=%d)", model_dim, args.num_memory_layers)
+        inject_memory_into_qwen35(model, mem_cfg)
+        if args.no_memory_write:
+            disable_memory_write(model)
+            log.info("--no-memory-write: NLM write disabled (E_C ablation — capacity-only)")
 
     # ------------------------------------------------------------------
     # LoRA
@@ -478,7 +483,12 @@ def _load_resume(
         n_loaded = len(adapter_state) - len(unexpected)
         log.info("Loaded %d params (missing=%d) from peft adapter: %s",
                  n_loaded, len(missing), resume_dir)
-        return 0  # peft format has no step info
+        # Cross-stage resume intentionally resets opt_step and optimizer state.
+        # Each stage has a different target LR (Stage1=2e-4 → Stage2=5e-5 → Stage3=1e-5);
+        # carrying Stage N's AdamW second-moment estimates (v) into Stage N+1 would
+        # corrupt the effective step size for the entire warmup phase, since v is
+        # calibrated to the previous LR scale. Fresh optimizer start is correct here.
+        return 0
 
     # Fallback: step_*.pt (keys are saved from peft model.named_parameters() — exact match)
     step_files = sorted(resume_dir.glob("step_*.pt"))
@@ -738,7 +748,20 @@ def train(
     if is_main:
         save_checkpoint(model, optimizer, opt_step, step_loss, output_dir)
         model.save_pretrained(str(output_dir / "final"))
+        # oracle_config.json：记录推理时必须一致的 marker 语言。
+        # MemoryOracle.from_pretrained() 读取此文件自动选择正确 markers，
+        # 避免 training/inference marker mismatch（曾导致 NLM 完全失效）。
+        oracle_cfg = {
+            "lang": args.lang,
+            "stage": args.stage,
+            "use_nlm": not args.no_nlm,
+            "memory_write": not getattr(args, "no_memory_write", False),
+        }
+        with open(output_dir / "final" / "oracle_config.json", "w") as _f:
+            json.dump(oracle_cfg, _f, indent=2)
         log.info("Saved peft model → %s/final", output_dir)
+        log.info("oracle_config.json: lang=%s stage=%d use_nlm=%s memory_write=%s",
+                 args.lang, args.stage, oracle_cfg["use_nlm"], oracle_cfg["memory_write"])
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +803,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lora-target", default="q_proj,k_proj,v_proj,o_proj")
 
     # Memory
+    p.add_argument("--no-nlm", action="store_true",
+                   help="Skip NLM injection (LoRA-only ablation baseline, E_A)")
+    p.add_argument("--no-memory-write", action="store_true",
+                   help="Inject NLM but disable write (capacity-only ablation, E_C)")
     p.add_argument("--num-memory-layers", type=int, default=1)
     p.add_argument("--memory-lr", type=float, default=0.1)
     p.add_argument("--memory-momentum", type=float, default=0.9)
@@ -833,6 +860,32 @@ def main() -> None:
         "Language: %s  markers=%s/%s/%s",
         args.lang.upper(), markers[1].strip(), markers[2].strip(), markers[3].strip(),
     )
+
+    # Resume lang consistency check: warn if previous stage used a different language.
+    # Training Stage N with lang=zh then Stage N+1 with lang=en causes marker mismatch
+    # (NLM writes Chinese markers into memory, eval reads English markers → garbage output).
+    if args.resume:
+        _resume_path = Path(args.resume)
+        # oracle_config.json lives in final/; also check resume path itself for flexibility
+        for _cfg_dir in (_resume_path, _resume_path / "final"):
+            _cfg_path = _cfg_dir / "oracle_config.json"
+            if _cfg_path.exists():
+                try:
+                    _prev_cfg = json.loads(_cfg_path.read_text())
+                    _prev_lang = _prev_cfg.get("lang")
+                    if _prev_lang and _prev_lang != args.lang:
+                        log.warning(
+                            "LANG MISMATCH: previous checkpoint used lang=%s, "
+                            "current training uses lang=%s. "
+                            "NLM memory markers will be inconsistent — "
+                            "this likely causes garbage eval output. "
+                            "Pass --lang %s to match the previous stage, "
+                            "or confirm this is intentional.",
+                            _prev_lang, args.lang, _prev_lang,
+                        )
+                except Exception:
+                    pass
+                break
 
     log.info("=== Memory Oracle Stage %d ===", args.stage)
     log.info("  model=%s  lr=%.1e  steps=%d  batch=%d  accum=%d",

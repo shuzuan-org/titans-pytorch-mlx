@@ -68,9 +68,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from titans.config import TitansConfig
 from titans.qwen35_injection import (
     disable_memory_write,
+    freeze_memory_updates,
     get_trainable_params,
     inject_memory_into_qwen35,
     reset_memory_states,
+    unfreeze_memory_updates,
 )
 
 try:
@@ -134,15 +136,19 @@ class OracleDataset(Dataset):
         max_seq_len: int = 2048,
         stage: int = 1,
         markers: tuple[str, str, str, str] | None = None,
+        split_write_read: bool = False,
     ) -> None:
         """
         Args:
             markers: (sys_prompt, write_prefix, read_prefix, target_prefix).
                      如果为 None，使用中文默认（向后兼容）。
+            split_write_read: 若 True，__getitem__ 返回 write_ids / read_ids / read_labels
+                     两段张量，供 --no-kv 两阶段训练使用。
         """
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.stage = stage
+        self.split_write_read = split_write_read
         self.samples = []
 
         if markers is None:
@@ -179,7 +185,12 @@ class OracleDataset(Dataset):
         # 各部分 token 预算：sys + writes + read + target <= max_seq_len
         # target 最多占 1/4；writes 在剩余空间内，超出则丢弃最老的（保留最近）
         keep_target = min(len(target_ids), self.max_seq_len // 4)
-        write_budget = max(0, self.max_seq_len - len(self._sys_ids) - len(read_ids) - keep_target)
+        if self.split_write_read:
+            # Split 模式：write 和 read 是独立序列，不共享 token 空间。
+            # Write pass budget = max_seq_len - sys（无需给 read/target 留空间）。
+            write_budget = max(0, self.max_seq_len - len(self._sys_ids))
+        else:
+            write_budget = max(0, self.max_seq_len - len(self._sys_ids) - len(read_ids) - keep_target)
         target_ids = target_ids[:keep_target]
 
         if self.stage == 3:
@@ -210,6 +221,29 @@ class OracleDataset(Dataset):
             else:
                 write_token_ids = all_write_ids
             write_entries = None  # Stage 1/2 不需要 per-entry 追踪
+
+        # --no-kv split mode：write 和 read 分成两个独立序列
+        if self.split_write_read:
+            if self.stage == 3:
+                # Stage 3 的 importance-weighted loss 作用在 write tokens 上，
+                # 但 split 模式不对 write pass 计算 loss（仅 NLM 写入），
+                # 所以 token_weights 被静默丢弃，Stage 3 curriculum 退化为纯 target CE。
+                log.warning(
+                    "Stage 3 + --no-kv: importance-weighted write loss is disabled; "
+                    "only target CE is computed (write tokens go to NLM only)."
+                )
+            # Write pass: sys + write_tokens（NLM 在 no_grad 中更新 state）
+            write_seq = self._sys_ids + write_token_ids
+            write_ids_t = torch.tensor(write_seq, dtype=torch.long)
+
+            # Read pass: sys + read_query + target（KV cache 中无 write tokens）
+            read_seq = self._sys_ids + read_ids + target_ids
+            read_prefix_len = len(self._sys_ids) + len(read_ids)
+            read_ids_t = torch.tensor(read_seq, dtype=torch.long)
+            read_labels_t = torch.full_like(read_ids_t, -100)
+            read_labels_t[read_prefix_len:] = read_ids_t[read_prefix_len:]
+
+            return {"write_ids": write_ids_t, "read_ids": read_ids_t, "read_labels": read_labels_t}
 
         # 拼装：sys + writes + read（read_ids 始终在末尾，不会被截断）
         prefix_ids = self._sys_ids + write_token_ids + read_ids
@@ -315,8 +349,38 @@ def make_collate_fn(pad_id: int):
     在 build_model 之前始终是 0（Qwen3.5 的 pad = EOS = 151643）。
     """
     def collate(batch: list[dict]) -> dict[str, Any]:
-        max_len = max(item["input_ids"].shape[0] for item in batch)
         B = len(batch)
+
+        # --no-kv split mode
+        if "write_ids" in batch[0]:
+            max_write = max(item["write_ids"].shape[0] for item in batch)
+            max_read  = max(item["read_ids"].shape[0]  for item in batch)
+
+            write_input  = torch.full((B, max_write), pad_id, dtype=torch.long)
+            write_mask   = torch.zeros((B, max_write),         dtype=torch.long)
+            read_input   = torch.full((B, max_read),  pad_id, dtype=torch.long)
+            read_labels  = torch.full((B, max_read),  -100,   dtype=torch.long)
+            read_mask    = torch.zeros((B, max_read),          dtype=torch.long)
+
+            for i, item in enumerate(batch):
+                wlen = item["write_ids"].shape[0]
+                write_input[i, :wlen] = item["write_ids"]
+                write_mask[i, :wlen]  = 1
+                rlen = item["read_ids"].shape[0]
+                read_input[i, :rlen]  = item["read_ids"]
+                read_labels[i, :rlen] = item["read_labels"]
+                read_mask[i, :rlen]   = 1
+
+            return {
+                "write_ids":   write_input,
+                "write_mask":  write_mask,
+                "read_ids":    read_input,
+                "read_labels": read_labels,
+                "read_mask":   read_mask,
+            }
+
+        # Normal mode
+        max_len = max(item["input_ids"].shape[0] for item in batch)
 
         input_ids = torch.full((B, max_len), pad_id, dtype=torch.long)
         labels    = torch.full((B, max_len), -100,   dtype=torch.long)
@@ -685,22 +749,45 @@ def train(
         if opt_step >= args.max_steps:
             break
 
-        input_ids   = batch["input_ids"].to(device,   non_blocking=True)
-        labels      = batch["labels"].to(device,      non_blocking=True)
-        attn_mask   = batch["attention_mask"].to(device, non_blocking=True)
-
         # 每个 batch 每个样本独立 reset（memory 不跨样本泄漏）
         reset_memory_states(model)
 
-        if args.stage == 3 and "token_weights" in batch:
-            # Stage 3：token-level importance weighted CE。
-            # 模型 forward 不传 labels（避免内部 mean CE），用 weighted_ce_loss 手动算。
-            outputs = model(input_ids=input_ids, attention_mask=attn_mask)
-            tw = batch["token_weights"].to(device, non_blocking=True)
-            lm_loss = weighted_ce_loss(outputs.logits, labels, tw)
-        else:
-            outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
+        if args.no_kv and "write_ids" in batch:
+            # --no-kv 两阶段：
+            # Pass 1（write）：no_grad 下全序列 forward，NLM 内部 enable_grad 仍工作，
+            #   积累 memory state；KV cache 不保留（不传 past_key_values）。
+            # Pass 2（read）：freeze NLM（只读），loss 仅在 target tokens，
+            #   梯度流回 LoRA + NLM 结构参数（proj_q / proj_out）。
+            write_ids  = batch["write_ids"].to(device,  non_blocking=True)
+            write_mask = batch["write_mask"].to(device, non_blocking=True)
+            read_ids   = batch["read_ids"].to(device,   non_blocking=True)
+            read_lbls  = batch["read_labels"].to(device, non_blocking=True)
+            read_mask  = batch["read_mask"].to(device,  non_blocking=True)
+
+            with torch.no_grad():
+                model(input_ids=write_ids, attention_mask=write_mask)
+
+            freeze_memory_updates(model)
+            outputs = model(input_ids=read_ids, attention_mask=read_mask, labels=read_lbls)
+            # Unfreeze before backward: safe because autograd graph is fully recorded
+            # during forward; backward replays the recorded graph and does not
+            # re-inspect _nlm_frozen at backward time.
+            unfreeze_memory_updates(model)
             lm_loss = outputs.loss
+        else:
+            input_ids   = batch["input_ids"].to(device,   non_blocking=True)
+            labels      = batch["labels"].to(device,      non_blocking=True)
+            attn_mask   = batch["attention_mask"].to(device, non_blocking=True)
+
+            if args.stage == 3 and "token_weights" in batch:
+                # Stage 3：token-level importance weighted CE。
+                # 模型 forward 不传 labels（避免内部 mean CE），用 weighted_ce_loss 手动算。
+                outputs = model(input_ids=input_ids, attention_mask=attn_mask)
+                tw = batch["token_weights"].to(device, non_blocking=True)
+                lm_loss = weighted_ce_loss(outputs.logits, labels, tw)
+            else:
+                outputs = model(input_ids=input_ids, attention_mask=attn_mask, labels=labels)
+                lm_loss = outputs.loss
 
         true_loss  = lm_loss.item()
         total_loss = lm_loss / args.grad_accum
@@ -756,6 +843,7 @@ def train(
             "stage": args.stage,
             "use_nlm": not args.no_nlm,
             "memory_write": not getattr(args, "no_memory_write", False),
+            "no_kv_training": getattr(args, "no_kv", False),
         }
         with open(output_dir / "final" / "oracle_config.json", "w") as _f:
             json.dump(oracle_cfg, _f, indent=2)
@@ -807,6 +895,10 @@ def parse_args() -> argparse.Namespace:
                    help="Skip NLM injection (LoRA-only ablation baseline, E_A)")
     p.add_argument("--no-memory-write", action="store_true",
                    help="Inject NLM but disable write (capacity-only ablation, E_C)")
+    p.add_argument("--no-kv", action="store_true",
+                   help="Two-pass training: write pass (no_grad, NLM accumulates state) "
+                        "then read pass (NLM frozen, loss on target tokens only). "
+                        "Forces model to rely on NLM rather than KV cache of write tokens.")
     p.add_argument("--num-memory-layers", type=int, default=1)
     p.add_argument("--memory-lr", type=float, default=0.1)
     p.add_argument("--memory-momentum", type=float, default=0.9)
@@ -913,13 +1005,18 @@ def main() -> None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # Dataset（单文件或多文件加权混合）
+    split_wr = args.no_kv and not args.no_nlm  # no-kv 无 NLM 无意义，静默降级
+    if args.no_kv and args.no_nlm:
+        log.warning("--no-kv has no effect when --no-nlm is set; ignoring --no-kv")
     if len(args.data) == 1:
         dataset: Dataset = OracleDataset(
-            args.data[0], tokenizer, args.seq_len, args.stage, markers=markers,
+            args.data[0], tokenizer, args.seq_len, args.stage,
+            markers=markers, split_write_read=split_wr,
         )
     else:
         sub_datasets = [
-            OracleDataset(p, tokenizer, args.seq_len, args.stage, markers=markers)
+            OracleDataset(p, tokenizer, args.seq_len, args.stage,
+                          markers=markers, split_write_read=split_wr)
             for p in args.data
         ]
         dataset = WeightedConcatDataset(sub_datasets, args.data_weights, seed=args.seed)

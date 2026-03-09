@@ -112,6 +112,7 @@ class MemoryOracle:
         max_seq_len: int = 8192,
         max_read_new_tokens: int = 200,
         lang: str = "en",
+        no_write_kv: bool = False,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -141,6 +142,9 @@ class MemoryOracle:
         self._cached_nlm_state: dict[int, Any] | None = None
         self._cached_write_kv: Any = None          # past_key_values 张量组
         self._cached_write_prefix_len: int = 0    # cached KV 对应的 token 数
+        # no_write_kv=True：write forward 不缓存 KV，read() 仅靠 NLM state 回答。
+        # 用于验证 NLM 的独立记忆能力（排除 KV cache shortcut）。
+        self._no_write_kv: bool = no_write_kv
 
     # ------------------------------------------------------------------
     # Factory
@@ -340,17 +344,20 @@ class MemoryOracle:
             max_length=self.max_seq_len,
         ).to(self.device)
 
-        # NLM unfrozen：反向传播更新权重；use_cache=True：保留 KV 供 read() 复用
+        # NLM unfrozen：反向传播更新权重。
+        # no_write_kv=False（默认）：use_cache=True 保留 KV 供 read() 复用。
+        # no_write_kv=True：不缓存 KV，read() 必须仅依赖 NLM state（验证 NLM 独立能力）。
+        use_kv = not self._no_write_kv
         write_output = self.model(
             input_ids=write_inputs["input_ids"],
             attention_mask=write_inputs["attention_mask"],
-            use_cache=True,
+            use_cache=use_kv,
         )
 
         # 缓存结果
         self._cached_nlm_state = get_nlm_states(self.model)
-        self._cached_write_kv = write_output.past_key_values
-        self._cached_write_prefix_len = write_inputs["input_ids"].shape[1]
+        self._cached_write_kv = write_output.past_key_values if use_kv else None
+        self._cached_write_prefix_len = write_inputs["input_ids"].shape[1] if use_kv else 0
         freeze_memory_updates(self.model)
         self._cache_valid = True
 
@@ -384,7 +391,9 @@ class MemoryOracle:
         set_nlm_states(self.model, self._cached_nlm_state)
         freeze_memory_updates(self.model)
 
-        # ── Pass 1：只 forward [READ]query，复用 write-phase KV cache ──────────
+        # ── Pass 1：forward [READ]query。
+        # 默认：复用 write-phase KV cache（write tokens 在 attention 范围内）。
+        # no_write_kv 模式：不传 past_key_values，NLM state 是唯一的记忆来源。
         read_query_str = self._read_prefix + query + "\n"
         read_inputs = self.tokenizer(
             read_query_str,
@@ -394,15 +403,15 @@ class MemoryOracle:
             max_length=self.max_seq_len,
         ).to(self.device)
 
-        past_len = self._cached_write_prefix_len
+        past_len = self._cached_write_prefix_len  # 0 when no_write_kv=True
         query_len = read_inputs["input_ids"].shape[1]
-        # attention_mask 覆盖：cached write prefix + 当前 query tokens
+        # attention_mask：默认覆盖 write prefix + query；no_write_kv 时只覆盖 query。
         query_attn_mask = torch.ones(1, past_len + query_len, dtype=torch.long, device=self.device)
 
         query_output = self.model(
             input_ids=read_inputs["input_ids"],
             attention_mask=query_attn_mask,
-            past_key_values=self._cached_write_kv,
+            past_key_values=self._cached_write_kv,  # None when no_write_kv=True
             use_cache=True,
         )
 

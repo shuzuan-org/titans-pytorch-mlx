@@ -283,6 +283,7 @@ def eval_with_oracle(
     device: str,
     max_examples: int | None,
     judge: LLMJudge | None,
+    no_write_kv: bool = False,
 ) -> list[dict]:
     """用 MemoryOracle 对每个 QA pair 评测。
 
@@ -291,6 +292,9 @@ def eval_with_oracle(
     2. 用 question 触发 oracle.read() 获得记忆摘要
     3. 用记忆摘要 + question 生成最终答案
     4. 用 judge / F1 评分
+
+    no_write_kv=True：read() 时不使用 write 阶段的 KV cache，
+        NLM state 是唯一记忆来源。用于验证 NLM 独立存储能力。
     """
     from titans.memory_oracle import MemoryOracle
 
@@ -299,7 +303,10 @@ def eval_with_oracle(
         oracle_ckpt,
         base_model=base_model,
         device=device,
+        no_write_kv=no_write_kv,
     )
+    if no_write_kv:
+        log.info("--no-write-kv: write KV cache disabled; read() relies on NLM state only")
 
     # oracle.model 已加载，复用它生成答案
     gen_model = oracle.model
@@ -530,6 +537,10 @@ def parse_args() -> argparse.Namespace:
                    help="当前 shard 索引（0-based），用于多 GPU 并行评测")
     p.add_argument("--total-shards", type=int, default=1,
                    help="总 shard 数，用于多 GPU 并行评测")
+    p.add_argument("--no-write-kv", action="store_true",
+                   help="Disable write-phase KV cache during read(). "
+                        "NLM state becomes the sole memory source. "
+                        "Use to measure true NLM-only recall (vs KV-cache-assisted).")
     return p.parse_args()
 
 
@@ -565,9 +576,10 @@ def main() -> None:
             log.error("Either --oracle or --baseline-only is required")
             sys.exit(1)
         results = eval_with_oracle(
-            args.oracle, qa_pairs, args.base_model, args.device, args.max_examples, judge
+            args.oracle, qa_pairs, args.base_model, args.device, args.max_examples, judge,
+            no_write_kv=args.no_write_kv,
         )
-        mode = "oracle"
+        mode = "oracle_no_kv" if args.no_write_kv else "oracle"
 
     # 汇总
     summary = summarize(results)

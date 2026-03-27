@@ -57,6 +57,22 @@ from titans.optimized_inference import (
     ContinuousBatcher,
     benchmark_generation,
 )
+from titans.stage1_models import (
+    Stage1ModelConfig,
+    Stage1SessionState,
+    Stage1SessionStats,
+    FrozenBackboneWithTimelineMemory,
+    DenseTimelineMemory,
+    build_stage1_model,
+)
+from titans.stage1_runtime import (
+    Stage1DeploymentRuntime,
+    Stage1SessionStore,
+    Stage1MemoryWriter,
+    Stage1ChatGenerator,
+    Stage1WriteResult,
+    Stage1ChatResult,
+)
 
 # Hub must be imported after models to avoid circular imports
 from titans.hub import load_from_hub, push_to_hub
@@ -108,4 +124,17 @@ __all__ = [
     "KVCacheConfig",
     "ContinuousBatcher",
     "benchmark_generation",
+    # Stage1 deployment
+    "Stage1ModelConfig",
+    "Stage1SessionState",
+    "Stage1SessionStats",
+    "FrozenBackboneWithTimelineMemory",
+    "DenseTimelineMemory",
+    "build_stage1_model",
+    "Stage1DeploymentRuntime",
+    "Stage1SessionStore",
+    "Stage1MemoryWriter",
+    "Stage1ChatGenerator",
+    "Stage1WriteResult",
+    "Stage1ChatResult",
 ]

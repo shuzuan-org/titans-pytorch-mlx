@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Implementation of Titans: Learning to Memorize at Test Time"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 authors = [
     { name = "Delanoe Pirard", email = "contact@aedelon.com" }
 ]

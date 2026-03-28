@@ -65,6 +65,14 @@ def read_json(req: request.Request, timeout: int) -> dict[str, Any]:
         raise RuntimeError(f"HTTP {exc.code}: {payload}") from exc
 
 
+def truncate_eval_answer(answer: str) -> str:
+    stripped = answer.strip()
+    marker_index = stripped.find("\n\n")
+    if marker_index != -1:
+        stripped = stripped[:marker_index].rstrip()
+    return stripped
+
+
 def main() -> None:
     args = parse_args()
     sample = load_sample(args.data_file, args.index)
@@ -134,9 +142,9 @@ def main() -> None:
     print(f"Sample index: {args.index}")
     print(f"Question: {question_chunk}")
     print(f"Gold / 标准答案: {gold_answer}")
-    print(f"With memory: {with_memory['answer']}")
-    print(f"Without memory: {without_memory['answer']}")
-    print(f"Direct Qwen: {direct_qwen['answer']}")
+    print(f"With memory: {truncate_eval_answer(with_memory['answer'])}")
+    print(f"Without memory: {truncate_eval_answer(without_memory['answer'])}")
+    print(f"Direct Qwen: {truncate_eval_answer(direct_qwen['answer'])}")
 
 
 if __name__ == "__main__":

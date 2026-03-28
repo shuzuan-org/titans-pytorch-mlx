@@ -198,7 +198,11 @@ def stage1_collate_fn(
     )
     prompt_lengths = prompt_tokens["attention_mask"].sum(dim=1).tolist()
 
-    full_texts = [f"{sample.prompt_text}{sample.answer_text}" for sample in batch]
+    eos_token = tokenizer.eos_token
+    if eos_token is None:
+        raise ValueError("Tokenizer must define eos_token")
+
+    full_texts = [f"{sample.prompt_text}{sample.answer_text}{eos_token}" for sample in batch]
     full_tokens = tokenizer(
         full_texts,
         padding="max_length",

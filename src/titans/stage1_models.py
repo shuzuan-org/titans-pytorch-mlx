@@ -147,9 +147,12 @@ class DenseTimelineMemory(nn.Module):
         self.output_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def init_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        return self.initial_memory.unsqueeze(0).expand(batch_size, -1, -1).to(device)
+        return self.initial_memory.unsqueeze(0).expand(batch_size, -1, -1).to(device=device)
 
     def update(self, state: torch.Tensor, write_repr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        target_dtype = self.write_key.weight.dtype
+        state = state.to(dtype=target_dtype)
+        write_repr = write_repr.to(dtype=target_dtype)
         key = self.write_key(write_repr)
         value = self.write_value(write_repr)
         scores = torch.matmul(state, key.unsqueeze(-1)).squeeze(-1) / (self.hidden_size**0.5)
@@ -160,11 +163,20 @@ class DenseTimelineMemory(nn.Module):
         return next_state, gate.squeeze(-1)
 
     def retrieve(self, state: torch.Tensor, query_repr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        target_dtype = self.query_proj.weight.dtype
+        state = state.to(dtype=target_dtype)
+        query_repr = query_repr.to(dtype=target_dtype)
         query = self.query_proj(query_repr)
         scores = torch.matmul(state, query.unsqueeze(-1)).squeeze(-1) / (self.hidden_size**0.5)
         weights = torch.softmax(scores, dim=-1)
         retrieved = torch.sum(weights.unsqueeze(-1) * state, dim=1)
         return self.output_proj(retrieved), weights
+
+
+
+
+def _build_question_prompt(question: str) -> str:
+    return f"问题：{question.strip()}\n答案："
 
 
 class FrozenBackboneWithTimelineMemory(nn.Module):
@@ -305,7 +317,8 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         query: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         self.validate_session_state(state)
-        input_ids, attention_mask = self._tokenize_texts([query])
+        formatted_query = _build_question_prompt(query)
+        input_ids, attention_mask = self._tokenize_texts([formatted_query])
         question_hidden = self.backbone.encode_tokens(input_ids, attention_mask)
         question_repr = self._pool_hidden(question_hidden, attention_mask)
         retrieved, retrieval_weights = self.memory.retrieve(state.memory_state, question_repr)
@@ -358,6 +371,25 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             "memory_version": session_snapshot.memory_version,
             "retrieval_weights": retrieval_weights.detach().cpu(),
             "session_state": session_snapshot,
+        }
+
+    def answer_query_direct(
+        self,
+        query: str,
+        generation_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        formatted_query = _build_question_prompt(query)
+        input_ids, attention_mask = self._tokenize_texts([formatted_query])
+        query_embeds = self.backbone.embed_input_ids(input_ids)
+        output_ids = self.backbone.generate_from_embeds(
+            inputs_embeds=query_embeds,
+            attention_mask=attention_mask,
+            generation_config=generation_config,
+        )
+        answer = self.backbone.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        return {
+            "answer": answer,
+            "retrieval_weights": None,
         }
 
     def load_trainable_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = False) -> None:

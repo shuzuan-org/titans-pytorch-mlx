@@ -167,6 +167,28 @@ class Stage1ChatGenerator:
             retrieval_weights=result["retrieval_weights"] if include_debug else None,
         )
 
+    def chat_direct(
+        self,
+        session_id: str,
+        query: str,
+        generation_config: dict[str, Any] | None = None,
+    ) -> Stage1ChatResult:
+        state = self.store.get(session_id)
+        if state is None:
+            state = self.model.init_session_state(session_id)
+            self.store.set(session_id, state)
+
+        result = self.model.answer_query_direct(
+            query=query,
+            generation_config=generation_config,
+        )
+        return Stage1ChatResult(
+            session_id=session_id,
+            answer=str(result["answer"]),
+            memory_version=int(state.memory_version),
+            retrieval_weights=None,
+        )
+
 
 class Stage1DeploymentRuntime:
     def __init__(
@@ -215,6 +237,18 @@ class Stage1DeploymentRuntime:
             query=query,
             generation_config=generation_config,
             include_debug=include_debug,
+        )
+
+    def chat_direct_backbone(
+        self,
+        session_id: str,
+        query: str,
+        generation_config: dict[str, Any] | None = None,
+    ) -> Stage1ChatResult:
+        return self.chat_generator.chat_direct(
+            session_id=session_id,
+            query=query,
+            generation_config=generation_config,
         )
 
     def delete_session(self, session_id: str) -> bool:

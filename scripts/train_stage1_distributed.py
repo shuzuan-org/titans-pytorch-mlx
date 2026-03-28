@@ -230,6 +230,10 @@ class Stage1Trainer:
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         total_params, trainable_params = unwrapped_model.count_parameters()
+        trainable_param_names = {
+            name for name, parameter in unwrapped_model.named_parameters() if parameter.requires_grad
+        }
+        state_dict = unwrapped_model.state_dict()
         checkpoint_payload = {
             "config": vars(self.config),
             "model_config": vars(unwrapped_model.config),
@@ -239,8 +243,8 @@ class Stage1Trainer:
             "trainable_params": trainable_params,
             "trainable_state_dict": {
                 name: tensor.detach().cpu()
-                for name, tensor in unwrapped_model.state_dict().items()
-                if tensor.requires_grad
+                for name, tensor in state_dict.items()
+                if name in trainable_param_names
             },
         }
         torch.save(checkpoint_payload, path / "stage1_state.pt")

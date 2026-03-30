@@ -61,6 +61,12 @@ def build_runtime(args: argparse.Namespace) -> Stage1DeploymentRuntime:
 class Stage1RequestHandler(BaseHTTPRequestHandler):
     runtime: Stage1DeploymentRuntime
 
+    def _log_profile(self, kind: str, session_id: str, profile: dict[str, Any]) -> None:
+        if not profile:
+            return
+        parts = [f"{key}={value:.4f}s" if isinstance(value, float) else f"{key}={value}" for key, value in profile.items()]
+        LOGGER.info("%s session=%s %s", kind, session_id, " ".join(parts))
+
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/v1/memory/write":
             self._handle_write_memory()
@@ -113,6 +119,7 @@ class Stage1RequestHandler(BaseHTTPRequestHandler):
             contents=contents,
             idempotency_key=payload.get("idempotency_key"),
         )
+        self._log_profile("write_memory", session_id, result.profile)
         self._write_json(HTTPStatus.OK, asdict(result))
 
     def _handle_chat_respond(self) -> None:
@@ -143,8 +150,11 @@ class Stage1RequestHandler(BaseHTTPRequestHandler):
             "answer": result.answer,
             "memory_version": result.memory_version,
         }
+        if result.profile:
+            response["profile"] = result.profile
         if include_debug and result.retrieval_weights is not None:
             response["retrieval_weights"] = result.retrieval_weights.tolist()
+        self._log_profile("chat_respond", session_id, result.profile)
         self._write_json(HTTPStatus.OK, response)
 
     def _extract_generation_config(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -212,6 +222,7 @@ def main() -> None:
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     )
     runtime = build_runtime(args)
+    LOGGER.info("Runtime device=%s dtype=%s", runtime.model.backbone.device, next(runtime.model.parameters()).dtype)
     handler = type("ConfiguredStage1RequestHandler", (Stage1RequestHandler,), {"runtime": runtime})
     server = ThreadingHTTPServer((args.host, args.port), handler)
     LOGGER.info("Serving stage1 on http://%s:%s", args.host, args.port)

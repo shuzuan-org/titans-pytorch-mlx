@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ class Stage1WriteResult:
     session_id: str
     memory_version: int
     num_items_written: int
+    profile: dict[str, float | int] = field(default_factory=dict)
 
 
 @dataclass
@@ -29,6 +30,7 @@ class Stage1ChatResult:
     answer: str
     memory_version: int
     retrieval_weights: torch.Tensor | None = None
+    profile: dict[str, float | int | str] = field(default_factory=dict)
 
 
 class Stage1SessionStore:
@@ -118,7 +120,7 @@ class Stage1MemoryWriter:
         lock = self.store._get_lock(session_id)
         with lock:
             state = self.store.get(session_id) or self.model.init_session_state(session_id)
-            next_state = self.model.write_texts(
+            next_state, profile = self.model.write_texts(
                 state,
                 texts,
                 updated_at=time.time(),
@@ -128,6 +130,7 @@ class Stage1MemoryWriter:
                 session_id=session_id,
                 memory_version=next_state.memory_version,
                 num_items_written=len(texts),
+                profile=profile,
             )
 
 
@@ -165,6 +168,7 @@ class Stage1ChatGenerator:
             answer=str(result["answer"]),
             memory_version=int(result["memory_version"]),
             retrieval_weights=result["retrieval_weights"] if include_debug else None,
+            profile=dict(result.get("profile", {})),
         )
 
     def chat_direct(
@@ -187,6 +191,7 @@ class Stage1ChatGenerator:
             answer=str(result["answer"]),
             memory_version=int(state.memory_version),
             retrieval_weights=None,
+            profile=dict(result.get("profile", {})),
         )
 
 
@@ -212,6 +217,8 @@ class Stage1DeploymentRuntime:
             payload = torch.load(Path(checkpoint_path), map_location="cpu", weights_only=False)
             trainable_state_dict = payload.get("trainable_state_dict", payload)
             model.load_trainable_state_dict(trainable_state_dict)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
         model.eval()
         return cls(model=model)
 

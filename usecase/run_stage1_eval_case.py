@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -37,7 +38,7 @@ def load_sample(data_file: str, index: int) -> dict[str, Any]:
     raise IndexError(f"sample index {index} out of range for {data_file}")
 
 
-def post_json(base_url: str, path: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+def post_json(base_url: str, path: str, payload: dict[str, Any], timeout: int) -> tuple[dict[str, Any], float]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = request.Request(
         urljoin(base_url.rstrip("/") + "/", path.lstrip("/")),
@@ -45,15 +46,21 @@ def post_json(base_url: str, path: str, payload: dict[str, Any], timeout: int) -
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    return read_json(req, timeout=timeout)
+    started_at = time.perf_counter()
+    response = read_json(req, timeout=timeout)
+    elapsed_seconds = time.perf_counter() - started_at
+    return response, elapsed_seconds
 
 
-def delete_json(base_url: str, path: str, timeout: int) -> dict[str, Any]:
+def delete_json(base_url: str, path: str, timeout: int) -> tuple[dict[str, Any], float]:
     req = request.Request(
         urljoin(base_url.rstrip("/") + "/", path.lstrip("/")),
         method="DELETE",
     )
-    return read_json(req, timeout=timeout)
+    started_at = time.perf_counter()
+    response = read_json(req, timeout=timeout)
+    elapsed_seconds = time.perf_counter() - started_at
+    return response, elapsed_seconds
 
 
 def read_json(req: request.Request, timeout: int) -> dict[str, Any]:
@@ -64,6 +71,15 @@ def read_json(req: request.Request, timeout: int) -> dict[str, Any]:
         payload = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code}: {payload}") from exc
 
+
+
+
+def print_profile(label: str, payload: dict[str, Any]) -> None:
+    profile = payload.get("profile")
+    if not isinstance(profile, dict) or not profile:
+        return
+    parts = [f"{key}={value:.4f}s" if isinstance(value, float) else f"{key}={value}" for key, value in profile.items()]
+    print(f"{label} profile: {' '.join(parts)}")
 
 def truncate_eval_answer(answer: str) -> str:
     stripped = answer.strip()
@@ -93,7 +109,7 @@ def main() -> None:
         "do_sample": args.temperature > 0,
     }
 
-    post_json(
+    write_result, write_elapsed = post_json(
         args.base_url,
         "/v1/memory/write",
         {
@@ -102,7 +118,7 @@ def main() -> None:
         },
         timeout=args.request_timeout,
     )
-    with_memory = post_json(
+    with_memory, with_memory_elapsed = post_json(
         args.base_url,
         "/v1/chat/respond",
         {
@@ -113,7 +129,7 @@ def main() -> None:
         timeout=args.request_timeout,
     )
 
-    direct_qwen = post_json(
+    direct_qwen, direct_qwen_elapsed = post_json(
         args.base_url,
         "/v1/chat/respond",
         {
@@ -125,8 +141,8 @@ def main() -> None:
         timeout=args.request_timeout,
     )
 
-    delete_json(args.base_url, f"/v1/sessions/{args.session_id}", timeout=args.request_timeout)
-    without_memory = post_json(
+    _, delete_elapsed = delete_json(args.base_url, f"/v1/sessions/{args.session_id}", timeout=args.request_timeout)
+    without_memory, without_memory_elapsed = post_json(
         args.base_url,
         "/v1/chat/respond",
         {
@@ -141,6 +157,15 @@ def main() -> None:
     print(f"Request timeout: {args.request_timeout}s")
     print(f"Sample index: {args.index}")
     print(f"Question: {question_chunk}")
+    print(f"Memory write elapsed: {write_elapsed:.3f}s")
+    print_profile("Memory write", write_result)
+    print(f"With memory elapsed: {with_memory_elapsed:.3f}s")
+    print_profile("With memory", with_memory)
+    print(f"Delete session elapsed: {delete_elapsed:.3f}s")
+    print(f"Without memory elapsed: {without_memory_elapsed:.3f}s")
+    print_profile("Without memory", without_memory)
+    print(f"Direct Qwen elapsed: {direct_qwen_elapsed:.3f}s")
+    print_profile("Direct Qwen", direct_qwen)
     print(f"Gold / 标准答案: {gold_answer}")
     print(f"With memory: {truncate_eval_answer(with_memory['answer'])}")
     print(f"Without memory: {truncate_eval_answer(without_memory['answer'])}")

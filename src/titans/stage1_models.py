@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -126,9 +127,27 @@ class FrozenBackboneAdapter(nn.Module):
             config["pad_token_id"] = self.tokenizer.pad_token_id
         if "eos_token_id" not in config:
             config["eos_token_id"] = self.tokenizer.eos_token_id
-        with torch.no_grad():
+        with torch.inference_mode():
             return self.model.generate(
                 inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                **config,
+            )
+
+    def generate_from_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        generation_config: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
+        config = dict(generation_config or {})
+        if "pad_token_id" not in config:
+            config["pad_token_id"] = self.tokenizer.pad_token_id
+        if "eos_token_id" not in config:
+            config["eos_token_id"] = self.tokenizer.eos_token_id
+        with torch.inference_mode():
+            return self.model.generate(
+                input_ids=input_ids,
                 attention_mask=attention_mask,
                 **config,
             )
@@ -293,23 +312,43 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         texts: list[str],
         *,
         updated_at: float | None = None,
-    ) -> Stage1SessionState:
+    ) -> tuple[Stage1SessionState, dict[str, float | int]]:
         if not texts:
-            return self.clone_session_state(state)
+            return self.clone_session_state(state), {
+                "num_texts": 0,
+                "tokenize_s": 0.0,
+                "encode_s": 0.0,
+                "update_s": 0.0,
+                "total_s": 0.0,
+            }
         self.validate_session_state(state)
+        total_started_at = time.perf_counter()
         next_state = self.clone_session_state(state)
+        tokenize_started_at = time.perf_counter()
+        input_ids, attention_mask = self._tokenize_texts(texts)
+        tokenize_elapsed = time.perf_counter() - tokenize_started_at
+        encode_started_at = time.perf_counter()
         with torch.no_grad():
-            for text in texts:
-                input_ids, attention_mask = self._tokenize_texts([text])
-                hidden_states = self.backbone.encode_tokens(input_ids, attention_mask)
-                write_repr = self._pool_hidden(hidden_states, attention_mask)
-                next_memory, _ = self.memory.update(next_state.memory_state, write_repr)
+            hidden_states = self.backbone.encode_tokens(input_ids, attention_mask)
+            write_reprs = self._pool_hidden(hidden_states, attention_mask)
+        encode_elapsed = time.perf_counter() - encode_started_at
+        update_started_at = time.perf_counter()
+        with torch.no_grad():
+            for write_repr in write_reprs.unbind(dim=0):
+                next_memory, _ = self.memory.update(next_state.memory_state, write_repr.unsqueeze(0))
                 next_state.memory_state = next_memory
                 next_state.memory_version += 1
                 next_state.stats.num_writes += 1
+        update_elapsed = time.perf_counter() - update_started_at
         if updated_at is not None:
             next_state.stats.updated_at = updated_at
-        return next_state
+        return next_state, {
+            "num_texts": len(texts),
+            "tokenize_s": tokenize_elapsed,
+            "encode_s": encode_elapsed,
+            "update_s": update_elapsed,
+            "total_s": time.perf_counter() - total_started_at,
+        }
 
     def retrieve_from_state(
         self,
@@ -352,17 +391,24 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         *,
         updated_at: float | None = None,
     ) -> dict[str, Any]:
+        total_started_at = time.perf_counter()
         session_snapshot = self.clone_session_state(state)
+        retrieve_started_at = time.perf_counter()
         full_embeds, full_attention_mask, retrieval_weights = self.build_chat_inputs(
             session_snapshot,
             query,
         )
+        retrieve_elapsed = time.perf_counter() - retrieve_started_at
+        generate_started_at = time.perf_counter()
         output_ids = self.backbone.generate_from_embeds(
             inputs_embeds=full_embeds,
             attention_mask=full_attention_mask,
             generation_config=generation_config,
         )
+        generate_elapsed = time.perf_counter() - generate_started_at
+        decode_started_at = time.perf_counter()
         answer = self.backbone.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        decode_elapsed = time.perf_counter() - decode_started_at
         if updated_at is not None:
             session_snapshot.stats.updated_at = updated_at
         session_snapshot.stats.num_queries += 1
@@ -371,6 +417,13 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             "memory_version": session_snapshot.memory_version,
             "retrieval_weights": retrieval_weights.detach().cpu(),
             "session_state": session_snapshot,
+            "profile": {
+                "path": "memory",
+                "retrieve_s": retrieve_elapsed,
+                "generate_s": generate_elapsed,
+                "decode_s": decode_elapsed,
+                "total_s": time.perf_counter() - total_started_at,
+            },
         }
 
     def answer_query_direct(
@@ -378,18 +431,31 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         query: str,
         generation_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        total_started_at = time.perf_counter()
         formatted_query = _build_question_prompt(query)
+        tokenize_started_at = time.perf_counter()
         input_ids, attention_mask = self._tokenize_texts([formatted_query])
-        query_embeds = self.backbone.embed_input_ids(input_ids)
-        output_ids = self.backbone.generate_from_embeds(
-            inputs_embeds=query_embeds,
+        tokenize_elapsed = time.perf_counter() - tokenize_started_at
+        generate_started_at = time.perf_counter()
+        output_ids = self.backbone.generate_from_input_ids(
+            input_ids=input_ids,
             attention_mask=attention_mask,
             generation_config=generation_config,
         )
+        generate_elapsed = time.perf_counter() - generate_started_at
+        decode_started_at = time.perf_counter()
         answer = self.backbone.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        decode_elapsed = time.perf_counter() - decode_started_at
         return {
             "answer": answer,
             "retrieval_weights": None,
+            "profile": {
+                "path": "direct_backbone",
+                "tokenize_s": tokenize_elapsed,
+                "generate_s": generate_elapsed,
+                "decode_s": decode_elapsed,
+                "total_s": time.perf_counter() - total_started_at,
+            },
         }
 
     def load_trainable_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = False) -> None:

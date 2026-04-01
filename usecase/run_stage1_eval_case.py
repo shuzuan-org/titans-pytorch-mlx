@@ -10,6 +10,8 @@ from typing import Any
 from urllib import error, request
 from urllib.parse import urljoin
 
+from titans.stage1_prompting import DEFAULT_STAGE1_PROMPT_VERSION
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one stage1 eval usecase through HTTP service.")
@@ -18,11 +20,12 @@ def parse_args() -> argparse.Namespace:
         default="data/generated/stage1_timeline_v2/eval.jsonl",
     )
     parser.add_argument("--index", type=int, default=0)
-    parser.add_argument("--session-id", default="stage1-eval-demo")
+    parser.add_argument("--session-id", default=None)
     parser.add_argument("--base-url", default="http://111.6.70.85:10115")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--request-timeout", type=int, default=180)
+    parser.add_argument("--prompt-version", default=DEFAULT_STAGE1_PROMPT_VERSION, choices=["v2", "v3", "v4"])
     return parser.parse_args()
 
 
@@ -92,6 +95,7 @@ def truncate_eval_answer(answer: str) -> str:
 def main() -> None:
     args = parse_args()
     sample = load_sample(args.data_file, args.index)
+    session_id = args.session_id or f"stage1-eval-{args.prompt_version}"
     history_chunks = sample.get("history_chunks")
     question_chunk = sample.get("question_chunk")
     gold_answer = sample.get("answer")
@@ -113,7 +117,7 @@ def main() -> None:
         args.base_url,
         "/v1/memory/write",
         {
-            "session_id": args.session_id,
+            "session_id": session_id,
             "contents": history_chunks,
         },
         timeout=args.request_timeout,
@@ -122,7 +126,7 @@ def main() -> None:
         args.base_url,
         "/v1/chat/respond",
         {
-            "session_id": args.session_id,
+            "session_id": session_id,
             "query": question_chunk,
             "generation_config": generation_config,
         },
@@ -133,7 +137,7 @@ def main() -> None:
         args.base_url,
         "/v1/chat/respond",
         {
-            "session_id": args.session_id,
+            "session_id": session_id,
             "query": question_chunk,
             "mode": "direct_backbone",
             "generation_config": generation_config,
@@ -141,12 +145,12 @@ def main() -> None:
         timeout=args.request_timeout,
     )
 
-    _, delete_elapsed = delete_json(args.base_url, f"/v1/sessions/{args.session_id}", timeout=args.request_timeout)
+    _, delete_elapsed = delete_json(args.base_url, f"/v1/sessions/{session_id}", timeout=args.request_timeout)
     without_memory, without_memory_elapsed = post_json(
         args.base_url,
         "/v1/chat/respond",
         {
-            "session_id": args.session_id,
+            "session_id": session_id,
             "query": question_chunk,
             "generation_config": generation_config,
         },
@@ -154,8 +158,10 @@ def main() -> None:
     )
 
     print(f"Base URL: {args.base_url}")
+    print(f"Prompt version: {args.prompt_version}")
     print(f"Request timeout: {args.request_timeout}s")
     print(f"Sample index: {args.index}")
+    print(f"Session ID: {session_id}")
     print(f"Question: {question_chunk}")
     print(f"Memory write elapsed: {write_elapsed:.3f}s")
     print_profile("Memory write", write_result)

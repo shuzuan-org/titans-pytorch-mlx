@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 from titans.stage1_data import Stage1Dataset, stage1_collate_fn
 from titans.stage1_models import Stage1ModelConfig, build_stage1_model
+from titans.stage1_prompting import DEFAULT_STAGE1_PROMPT_VERSION, default_stage1_checkpoint_dir
 
 try:
     from accelerate import Accelerator
@@ -40,7 +41,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Stage1TrainingConfig:
     data_dir: str = "data/generated/stage1_timeline_v2"
-    checkpoint_dir: str = "checkpoints/stage1_timeline_v2"
+    checkpoint_dir: str = default_stage1_checkpoint_dir(DEFAULT_STAGE1_PROMPT_VERSION)
     backbone: str = "qwen"
     backbone_name: str = "Qwen/Qwen2.5-7B-Instruct"
     torch_dtype: str = "auto"
@@ -76,6 +77,8 @@ class Stage1TrainingConfig:
     wandb: bool = False
     wandb_project: str = "titans-stage1-timeline"
     wandb_run_name: str | None = None
+    prompt_version: str = DEFAULT_STAGE1_PROMPT_VERSION
+    use_write_gate_loss: bool = False
 
 
 class Stage1Trainer:
@@ -339,7 +342,7 @@ class Stage1Trainer:
 def parse_args() -> Stage1TrainingConfig:
     parser = argparse.ArgumentParser(description="Train stage1 timeline memory with accelerate")
     parser.add_argument("--data-dir", default="data/generated/stage1_timeline_v2")
-    parser.add_argument("--checkpoint-dir", default="checkpoints/stage1_timeline_v2")
+    parser.add_argument("--checkpoint-dir", default=None)
     parser.add_argument("--backbone", default="qwen", choices=["qwen"])
     parser.add_argument("--backbone-name", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--torch-dtype", default="auto")
@@ -375,7 +378,11 @@ def parse_args() -> Stage1TrainingConfig:
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", default="titans-stage1-timeline")
     parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--prompt-version", default=DEFAULT_STAGE1_PROMPT_VERSION, choices=["v2", "v3", "v4"])
+    parser.add_argument("--use-write-gate-loss", action="store_true")
     args = parser.parse_args()
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = default_stage1_checkpoint_dir(args.prompt_version)
     return Stage1TrainingConfig(**vars(args))
 
 
@@ -391,7 +398,7 @@ def build_dataloaders(
         max_sequence_length=config.max_sequence_length,
         loss_mask_scope=config.loss_mask_scope,
     )
-    train_dataset = Stage1Dataset(config.data_dir, split="train")
+    train_dataset = Stage1Dataset(config.data_dir, split="train", prompt_version=config.prompt_version)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -402,7 +409,7 @@ def build_dataloaders(
     )
     eval_dataloaders = {
         "timeline": DataLoader(
-            Stage1Dataset(config.data_dir, split="eval"),
+            Stage1Dataset(config.data_dir, split="eval", prompt_version=config.prompt_version),
             batch_size=config.eval_batch_size,
             shuffle=False,
             num_workers=config.num_workers,
@@ -432,8 +439,12 @@ def main() -> None:
         memory_hidden_mult=config.memory_hidden_mult,
         memory_dropout=config.memory_dropout,
         trust_remote_code=config.trust_remote_code,
+        prompt_version=config.prompt_version,
+        use_write_gate_loss=config.use_write_gate_loss,
     )
     model = build_stage1_model(model_config)
+    logger.info("Prompt version: %s", config.prompt_version)
+    logger.info("Checkpoint dir: %s", config.checkpoint_dir)
     total_params, trainable_params = model.count_parameters()
     logger.info("Total parameters: %s", f"{total_params:,}")
     logger.info("Trainable parameters: %s", f"{trainable_params:,}")

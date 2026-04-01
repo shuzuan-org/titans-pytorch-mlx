@@ -14,6 +14,11 @@ except ImportError:  # pragma: no cover
     AutoModelForCausalLM = None
     AutoTokenizer = None
 
+from titans.stage1_prompting import (
+    DEFAULT_STAGE1_PROMPT_VERSION,
+    build_stage1_question_prompt,
+)
+
 
 @dataclass
 class Stage1ModelConfig:
@@ -28,6 +33,8 @@ class Stage1ModelConfig:
     memory_hidden_mult: float = 2.0
     memory_dropout: float = 0.0
     trust_remote_code: bool = False
+    prompt_version: str = DEFAULT_STAGE1_PROMPT_VERSION
+    use_write_gate_loss: bool = False
 
 
 @dataclass
@@ -193,11 +200,6 @@ class DenseTimelineMemory(nn.Module):
 
 
 
-
-def _build_question_prompt(question: str) -> str:
-    return f"问题：{question.strip()}\n答案："
-
-
 class FrozenBackboneWithTimelineMemory(nn.Module):
     session_format_version = "stage1-session-v1"
 
@@ -210,6 +212,8 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             memory_slots=config.memory_slots,
         )
         self.write_decision_head = nn.Linear(self.backbone.hidden_size, 1)
+        if not self.config.use_write_gate_loss:
+            self.write_decision_head.requires_grad_(False)
 
     def get_trainable_parameters(self) -> list[nn.Parameter]:
         return [parameter for parameter in self.parameters() if parameter.requires_grad]
@@ -356,7 +360,7 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         query: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         self.validate_session_state(state)
-        formatted_query = _build_question_prompt(query)
+        formatted_query = build_stage1_question_prompt(query, self.config.prompt_version)
         input_ids, attention_mask = self._tokenize_texts([formatted_query])
         question_hidden = self.backbone.encode_tokens(input_ids, attention_mask)
         question_repr = self._pool_hidden(question_hidden, attention_mask)
@@ -432,7 +436,7 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         generation_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         total_started_at = time.perf_counter()
-        formatted_query = _build_question_prompt(query)
+        formatted_query = build_stage1_question_prompt(query, self.config.prompt_version)
         tokenize_started_at = time.perf_counter()
         input_ids, attention_mask = self._tokenize_texts([formatted_query])
         tokenize_elapsed = time.perf_counter() - tokenize_started_at
@@ -489,8 +493,9 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             chunk_attention_mask = history_attention_mask[:, chunk_index]
             hidden_states = self.backbone.encode_tokens(chunk_input_ids, chunk_attention_mask)
             write_repr = self._pool_hidden(hidden_states, chunk_attention_mask)
-            predicted_gate_logits = self.write_decision_head(write_repr).squeeze(-1)
-            write_gate_logits.append(predicted_gate_logits)
+            if self.config.use_write_gate_loss:
+                predicted_gate_logits = self.write_decision_head(write_repr).squeeze(-1)
+                write_gate_logits.append(predicted_gate_logits)
             memory_state, _ = self.memory.update(memory_state, write_repr)
 
         question_hidden = self.backbone.encode_tokens(question_input_ids, question_attention_mask)
@@ -522,7 +527,7 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             raise RuntimeError("Backbone did not return loss")
 
         write_gate_loss = torch.tensor(0.0, device=device)
-        if write_counts is not None and write_gate_logits:
+        if self.config.use_write_gate_loss and write_counts is not None and write_gate_logits:
             average_gate_logits = torch.stack(write_gate_logits, dim=1).mean(dim=1)
             write_targets = (write_counts > 0).to(dtype=average_gate_logits.dtype)
             write_gate_loss = nn.functional.binary_cross_entropy_with_logits(

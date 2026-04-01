@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from pathlib import Path
 from dataclasses import asdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,6 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from titans.stage1_models import Stage1ModelConfig
+from titans.stage1_prompting import DEFAULT_STAGE1_PROMPT_VERSION, default_stage1_checkpoint_path
 from titans.stage1_runtime import Stage1DeploymentRuntime
 
 
@@ -23,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--backbone-name", default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--checkpoint-path")
+    parser.add_argument("--checkpoint-path", default=None)
     parser.add_argument("--torch-dtype", default="auto")
     parser.add_argument("--attn-implementation")
     parser.add_argument("--memory-slots", type=int, default=16)
@@ -35,7 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loss-mask-scope", default="answer_only")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--log-level", default="INFO")
-    return parser.parse_args()
+    parser.add_argument("--prompt-version", default=DEFAULT_STAGE1_PROMPT_VERSION, choices=["v2", "v3", "v4"])
+    args = parser.parse_args()
+    if args.checkpoint_path is None:
+        default_checkpoint_path = default_stage1_checkpoint_path(args.prompt_version)
+        args.checkpoint_path = str(default_checkpoint_path) if default_checkpoint_path.exists() else None
+    return args
 
 
 def build_runtime(args: argparse.Namespace) -> Stage1DeploymentRuntime:
@@ -51,6 +58,7 @@ def build_runtime(args: argparse.Namespace) -> Stage1DeploymentRuntime:
         memory_hidden_mult=args.memory_hidden_mult,
         memory_dropout=args.memory_dropout,
         trust_remote_code=args.trust_remote_code,
+        prompt_version=args.prompt_version,
     )
     return Stage1DeploymentRuntime.from_model_config(
         config=config,
@@ -222,6 +230,7 @@ def main() -> None:
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     )
     runtime = build_runtime(args)
+    LOGGER.info("Runtime prompt_version=%s checkpoint_path=%s", args.prompt_version, args.checkpoint_path)
     LOGGER.info("Runtime device=%s dtype=%s", runtime.model.backbone.device, next(runtime.model.parameters()).dtype)
     handler = type("ConfiguredStage1RequestHandler", (Stage1RequestHandler,), {"runtime": runtime})
     server = ThreadingHTTPServer((args.host, args.port), handler)

@@ -8,13 +8,12 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
-
-def _normalize_text(text: str) -> str:
-    return text.strip()
-
-
-def _build_question_prompt(question: str) -> str:
-    return f"问题：{_normalize_text(question)}\n答案："
+from titans.stage1_prompting import (
+    DEFAULT_STAGE1_PROMPT_VERSION,
+    build_stage1_question_prompt,
+    normalize_stage1_text,
+    validate_stage1_prompt_version,
+)
 
 
 @dataclass
@@ -30,9 +29,10 @@ class Stage1QueryInstance:
 
 
 class Stage1Dataset(Dataset[Stage1QueryInstance]):
-    def __init__(self, data_dir: str | Path, split: str = "train") -> None:
+    def __init__(self, data_dir: str | Path, split: str = "train", prompt_version: str = DEFAULT_STAGE1_PROMPT_VERSION) -> None:
         self.data_dir = Path(data_dir)
         self.split = split
+        self.prompt_version = validate_stage1_prompt_version(prompt_version)
         self.samples = self._load_split(split)
 
     def _load_split(self, split: str) -> list[Stage1QueryInstance]:
@@ -61,17 +61,17 @@ class Stage1Dataset(Dataset[Stage1QueryInstance]):
             return self._flatten_timeline_episode(row)
 
         if "history_chunks" in row and "question_chunk" in row and "answer" in row:
-            question = _normalize_text(row["question_chunk"])
-            answer = _normalize_text(row["answer"])
+            question = normalize_stage1_text(row["question_chunk"])
+            answer = normalize_stage1_text(row["answer"])
             meta = dict(row.get("meta", {}))
             return [
                 Stage1QueryInstance(
                     episode_id=row.get("episode_id", row.get("sample_id", "legacy")),
                     question_id=row.get("question_id", f"{row.get('episode_id', 'legacy')}:q0"),
-                    history_chunks=[_normalize_text(chunk) for chunk in row["history_chunks"]],
+                    history_chunks=[normalize_stage1_text(chunk) for chunk in row["history_chunks"]],
                     question=question,
                     answer=answer,
-                    prompt_text=_build_question_prompt(question),
+                    prompt_text=build_stage1_question_prompt(question, self.prompt_version),
                     answer_text=answer,
                     meta=meta,
                 )
@@ -84,13 +84,13 @@ class Stage1Dataset(Dataset[Stage1QueryInstance]):
         samples: list[Stage1QueryInstance] = []
         for step in row["timeline"]:
             if step["event_type"] in {"write", "noop"}:
-                history_prefix.append(_normalize_text(step["text"]))
+                history_prefix.append(normalize_stage1_text(step["text"]))
                 continue
             if step["event_type"] != "query":
                 continue
             for question in step["questions"]:
-                text = _normalize_text(question["question"])
-                answer = _normalize_text(question["answer"])
+                text = normalize_stage1_text(question["question"])
+                answer = normalize_stage1_text(question["answer"])
                 sample_meta = {
                     **dict(row.get("meta", {})),
                     "schema_version": row.get("schema_version"),
@@ -108,7 +108,7 @@ class Stage1Dataset(Dataset[Stage1QueryInstance]):
                         history_chunks=list(history_prefix),
                         question=text,
                         answer=answer,
-                        prompt_text=_build_question_prompt(text),
+                        prompt_text=build_stage1_question_prompt(text, self.prompt_version),
                         answer_text=answer,
                         meta=sample_meta,
                     )

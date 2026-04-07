@@ -79,6 +79,17 @@ class Stage1TrainingConfig:
     wandb_run_name: str | None = None
     prompt_version: str = DEFAULT_STAGE1_PROMPT_VERSION
     use_write_gate_loss: bool = False
+    num_memory_layers: int = 1
+    memory_lr: float = 0.1
+    memory_momentum: float = 0.9
+    memory_decay: float = 0.01
+    nlm_init_std: float = 0.02
+    # LoRA config
+    use_lora: bool = False
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_target: str = "q_proj,k_proj,v_proj,o_proj"
+    lora_dropout: float = 0.05
 
 
 class Stage1Trainer:
@@ -91,7 +102,7 @@ class Stage1Trainer:
     ) -> None:
         self.config = config
 
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         self.accelerator = Accelerator(
             gradient_accumulation_steps=config.grad_accum,
             mixed_precision=config.precision if config.precision != "none" else "no",
@@ -260,6 +271,24 @@ class Stage1Trainer:
             )
         logger.info("Saved checkpoint to %s", path)
 
+        # Clean up old step checkpoints, keep only the latest max_keep
+        if name.startswith("step_"):
+            self._cleanup_old_checkpoints(max_keep=20)
+
+    def _cleanup_old_checkpoints(self, max_keep: int = 20) -> None:
+        """Remove oldest step_* checkpoints, keeping only the latest max_keep."""
+        step_dirs = sorted(
+            [d for d in self.checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith("step_")],
+            key=lambda d: int(d.name.split("_")[1]) if d.name.split("_")[1].isdigit() else 0,
+        )
+        if len(step_dirs) <= max_keep:
+            return
+        to_remove = step_dirs[: len(step_dirs) - max_keep]
+        for d in to_remove:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+            logger.info("Removed old checkpoint: %s", d)
+
     def load_checkpoint(self, path: Path) -> None:
         self.accelerator.load_state(str(path))
         trainer_state_path = path / "trainer_state.json"
@@ -380,6 +409,16 @@ def parse_args() -> Stage1TrainingConfig:
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--prompt-version", default=DEFAULT_STAGE1_PROMPT_VERSION, choices=["v2", "v3", "v4"])
     parser.add_argument("--use-write-gate-loss", action="store_true")
+    parser.add_argument("--num-memory-layers", type=int, default=1)
+    parser.add_argument("--memory-lr", type=float, default=0.1)
+    parser.add_argument("--memory-momentum", type=float, default=0.9)
+    parser.add_argument("--memory-decay", type=float, default=0.01)
+    parser.add_argument("--nlm-init-std", type=float, default=0.02)
+    parser.add_argument("--use-lora", action="store_true")
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-target", default="q_proj,k_proj,v_proj,o_proj")
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
     args = parser.parse_args()
     if args.checkpoint_dir is None:
         args.checkpoint_dir = default_stage1_checkpoint_dir(args.prompt_version)
@@ -441,6 +480,16 @@ def main() -> None:
         trust_remote_code=config.trust_remote_code,
         prompt_version=config.prompt_version,
         use_write_gate_loss=config.use_write_gate_loss,
+        num_memory_layers=config.num_memory_layers,
+        memory_lr=config.memory_lr,
+        memory_momentum=config.memory_momentum,
+        memory_decay=config.memory_decay,
+        nlm_init_std=config.nlm_init_std,
+        use_lora=config.use_lora,
+        lora_rank=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_target=config.lora_target,
+        lora_dropout=config.lora_dropout,
     )
     model = build_stage1_model(model_config)
     logger.info("Prompt version: %s", config.prompt_version)

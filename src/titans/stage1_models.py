@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover
     AutoModelForCausalLM = None
     AutoTokenizer = None
 
+from titans.neural_memory import NLMConfig, NLMState, NeuralLongTermMemory
 from titans.stage1_prompting import (
     DEFAULT_STAGE1_PROMPT_VERSION,
     build_stage1_question_prompt,
@@ -29,12 +30,25 @@ class Stage1ModelConfig:
     memory_update_source: str = "last_hidden"
     num_retrieved_memory_tokens: int = 16
     loss_mask_scope: str = "answer_only"
-    memory_slots: int = 16
-    memory_hidden_mult: float = 2.0
+    memory_slots: int = 16  # kept for backward compat; not used by NLM
+    memory_hidden_mult: float = 4.0
     memory_dropout: float = 0.0
     trust_remote_code: bool = False
     prompt_version: str = DEFAULT_STAGE1_PROMPT_VERSION
     use_write_gate_loss: bool = False
+    # NLM config
+    num_memory_layers: int = 1
+    num_memory_tokens: int = 64
+    memory_lr: float = 0.1
+    memory_momentum: float = 0.9
+    memory_decay: float = 0.01
+    nlm_init_std: float = 0.02
+    # LoRA config
+    use_lora: bool = False
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_target: str = "q_proj,k_proj,v_proj,o_proj"
+    lora_dropout: float = 0.05
 
 
 @dataclass
@@ -50,7 +64,7 @@ class Stage1SessionState:
     session_id: str
     memory_version: int
     model_signature: dict[str, Any]
-    memory_state: torch.Tensor
+    memory_state: NLMState
     stats: Stage1SessionStats
 
 
@@ -78,7 +92,30 @@ class FrozenBackboneAdapter(nn.Module):
         )
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        self.freeze_parameters()
+
+        if config.use_lora:
+            self._apply_lora(config)
+        else:
+            self.freeze_parameters()
+
+    def _apply_lora(self, config: Stage1ModelConfig) -> None:
+        """Apply LoRA to backbone attention layers."""
+        from peft import LoraConfig, TaskType, get_peft_model
+
+        target_modules = [m.strip() for m in config.lora_target.split(",")]
+        lora_config = LoraConfig(
+            r=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=config.lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        self.model = get_peft_model(self.model, lora_config)
+        # Freeze non-LoRA parameters
+        for name, param in self.model.named_parameters():
+            if "lora_" not in name:
+                param.requires_grad_(False)
 
     @property
     def hidden_size(self) -> int:
@@ -160,57 +197,30 @@ class FrozenBackboneAdapter(nn.Module):
             )
 
 
-class DenseTimelineMemory(nn.Module):
-    def __init__(self, hidden_size: int, memory_slots: int) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.memory_slots = memory_slots
-        self.initial_memory = nn.Parameter(torch.randn(memory_slots, hidden_size) * 0.02)
-        self.write_key = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.write_value = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.write_gate = nn.Linear(hidden_size, 1)
-        self.query_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.output_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-
-    def init_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        return self.initial_memory.unsqueeze(0).expand(batch_size, -1, -1).to(device=device)
-
-    def update(self, state: torch.Tensor, write_repr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        target_dtype = self.write_key.weight.dtype
-        state = state.to(dtype=target_dtype)
-        write_repr = write_repr.to(dtype=target_dtype)
-        key = self.write_key(write_repr)
-        value = self.write_value(write_repr)
-        scores = torch.matmul(state, key.unsqueeze(-1)).squeeze(-1) / (self.hidden_size**0.5)
-        weights = torch.softmax(scores, dim=-1)
-        gate = torch.sigmoid(self.write_gate(write_repr))
-        update = weights.unsqueeze(-1) * value.unsqueeze(1)
-        next_state = state + gate.unsqueeze(-1) * update
-        return next_state, gate.squeeze(-1)
-
-    def retrieve(self, state: torch.Tensor, query_repr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        target_dtype = self.query_proj.weight.dtype
-        state = state.to(dtype=target_dtype)
-        query_repr = query_repr.to(dtype=target_dtype)
-        query = self.query_proj(query_repr)
-        scores = torch.matmul(state, query.unsqueeze(-1)).squeeze(-1) / (self.hidden_size**0.5)
-        weights = torch.softmax(scores, dim=-1)
-        retrieved = torch.sum(weights.unsqueeze(-1) * state, dim=1)
-        return self.output_proj(retrieved), weights
-
-
-
 class FrozenBackboneWithTimelineMemory(nn.Module):
-    session_format_version = "stage1-session-v1"
+    session_format_version = "stage1-session-v2"
 
     def __init__(self, config: Stage1ModelConfig) -> None:
         super().__init__()
         self.config = config
         self.backbone = FrozenBackboneAdapter(config)
-        self.memory = DenseTimelineMemory(
-            hidden_size=self.backbone.hidden_size,
-            memory_slots=config.memory_slots,
+
+        nlm_config = NLMConfig(
+            dim=self.backbone.hidden_size,
+            num_memory_layers=config.num_memory_layers,
+            memory_hidden_mult=config.memory_hidden_mult,
+            memory_lr=config.memory_lr,
+            memory_momentum=config.memory_momentum,
+            memory_decay=config.memory_decay,
+            init_std=config.nlm_init_std,
         )
+        self.memory = NeuralLongTermMemory(nlm_config)
+
+        # Learnable query tokens for memory retrieval
+        self.memory_query_tokens = nn.Parameter(
+            torch.randn(config.num_memory_tokens, self.backbone.hidden_size) * 0.02
+        )
+
         self.write_decision_head = nn.Linear(self.backbone.hidden_size, 1)
         if not self.config.use_write_gate_loss:
             self.write_decision_head.requires_grad_(False)
@@ -233,7 +243,7 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         return {
             "backbone_name": self.config.backbone_name,
             "hidden_size": self.backbone.hidden_size,
-            "memory_slots": self.config.memory_slots,
+            "num_memory_layers": self.config.num_memory_layers,
             "config_hash": config_hash,
         }
 
@@ -261,7 +271,7 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             session_id=session_id,
             memory_version=0,
             model_signature=self.model_signature(),
-            memory_state=self.memory.init_state(1, self.backbone.device),
+            memory_state=self.memory.init_state(self.backbone.device),
             stats=Stage1SessionStats(),
         )
 
@@ -271,7 +281,7 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             session_id=state.session_id,
             memory_version=state.memory_version,
             model_signature=dict(state.model_signature),
-            memory_state=state.memory_state.detach().clone(),
+            memory_state=state.memory_state.clone(),
             stats=Stage1SessionStats(**asdict(state.stats)),
         )
 
@@ -281,34 +291,26 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             "session_id": state.session_id,
             "memory_version": state.memory_version,
             "model_signature": dict(state.model_signature),
-            "memory_state": state.memory_state.detach().cpu(),
+            "memory_weights": [w.detach().cpu() for w in state.memory_state.weights],
+            "memory_momentum": [m.detach().cpu() for m in state.memory_state.momentum],
             "stats": asdict(state.stats),
         }
 
     def deserialize_session_state(self, payload: dict[str, Any]) -> Stage1SessionState:
+        device = self.backbone.device
+        memory_state = NLMState(
+            weights=[w.to(device) for w in payload["memory_weights"]],
+            momentum=[m.to(device) for m in payload["memory_momentum"]],
+        )
         state = Stage1SessionState(
             format_version=str(payload["format_version"]),
             session_id=str(payload["session_id"]),
             memory_version=int(payload["memory_version"]),
             model_signature=dict(payload["model_signature"]),
-            memory_state=payload["memory_state"].to(self.backbone.device),
+            memory_state=memory_state,
             stats=Stage1SessionStats(**dict(payload["stats"])),
         )
-        self.validate_session_state(state)
         return state
-
-    def validate_session_state(self, state: Stage1SessionState) -> None:
-        if state.format_version != self.session_format_version:
-            raise ValueError(
-                f"Unexpected session format {state.format_version}, expected {self.session_format_version}"
-            )
-        if state.model_signature != self.model_signature():
-            raise ValueError("Session state model signature does not match runtime model")
-        expected_shape = (1, self.config.memory_slots, self.backbone.hidden_size)
-        if tuple(state.memory_state.shape) != expected_shape:
-            raise ValueError(
-                f"Unexpected memory state shape {tuple(state.memory_state.shape)}, expected {expected_shape}"
-            )
 
     def write_texts(
         self,
@@ -325,7 +327,6 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
                 "update_s": 0.0,
                 "total_s": 0.0,
             }
-        self.validate_session_state(state)
         total_started_at = time.perf_counter()
         next_state = self.clone_session_state(state)
         tokenize_started_at = time.perf_counter()
@@ -334,15 +335,14 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         encode_started_at = time.perf_counter()
         with torch.no_grad():
             hidden_states = self.backbone.encode_tokens(input_ids, attention_mask)
-            write_reprs = self._pool_hidden(hidden_states, attention_mask)
         encode_elapsed = time.perf_counter() - encode_started_at
         update_started_at = time.perf_counter()
-        with torch.no_grad():
-            for write_repr in write_reprs.unbind(dim=0):
-                next_memory, _ = self.memory.update(next_state.memory_state, write_repr.unsqueeze(0))
-                next_state.memory_state = next_memory
-                next_state.memory_version += 1
-                next_state.stats.num_writes += 1
+        # NLM write: pass hidden_states through NLM's write method
+        # hidden_states shape: (batch, seq, dim) — we use it directly
+        new_memory = self.memory.write(hidden_states, next_state.memory_state)
+        next_state.memory_state = new_memory
+        next_state.memory_version += len(texts)
+        next_state.stats.num_writes += len(texts)
         update_elapsed = time.perf_counter() - update_started_at
         if updated_at is not None:
             next_state.stats.updated_at = updated_at
@@ -357,35 +357,39 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
     def retrieve_from_state(
         self,
         state: Stage1SessionState,
-        query: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        self.validate_session_state(state)
-        formatted_query = build_stage1_question_prompt(query, self.config.prompt_version)
-        input_ids, attention_mask = self._tokenize_texts([formatted_query])
-        question_hidden = self.backbone.encode_tokens(input_ids, attention_mask)
-        question_repr = self._pool_hidden(question_hidden, attention_mask)
-        retrieved, retrieval_weights = self.memory.retrieve(state.memory_state, question_repr)
-        return retrieved, retrieval_weights, input_ids, attention_mask
+    ) -> torch.Tensor:
+        """Retrieve from memory using learnable query tokens.
+
+        Returns:
+            retrieved: (1, num_memory_tokens, dim)
+        """
+        # Use learnable query tokens, not question hidden states
+        query = self.memory_query_tokens.unsqueeze(0)  # (1, 64, dim)
+        retrieved = self.memory.retrieve(query, state.memory_state)
+        return retrieved
 
     def build_chat_inputs(
         self,
         state: Stage1SessionState,
         query: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        retrieved, retrieval_weights, input_ids, attention_mask = self.retrieve_from_state(
-            state,
-            query,
-        )
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        retrieved = self.retrieve_from_state(state)  # (1, 64, dim)
+        formatted_query = build_stage1_question_prompt(query, self.config.prompt_version)
+        input_ids, attention_mask = self._tokenize_texts([formatted_query])
         token_embeds = self.backbone.embed_input_ids(input_ids)
-        prefix_embeds = retrieved.unsqueeze(1).to(dtype=token_embeds.dtype)
+        # Scale prefix to match token embedding norm
+        prefix = retrieved.to(dtype=token_embeds.dtype)
+        token_norm = token_embeds.norm(dim=-1, keepdim=True).mean()
+        prefix_norm = prefix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        prefix = prefix * (token_norm / prefix_norm)
         prefix_attention_mask = torch.ones(
-            (1, 1),
+            (1, prefix.shape[1]),
             device=attention_mask.device,
             dtype=attention_mask.dtype,
         )
-        full_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)
+        full_embeds = torch.cat([prefix, token_embeds], dim=1)
         full_attention_mask = torch.cat([prefix_attention_mask, attention_mask], dim=1)
-        return full_embeds, full_attention_mask, retrieval_weights
+        return full_embeds, full_attention_mask
 
     def answer_query(
         self,
@@ -398,10 +402,7 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         total_started_at = time.perf_counter()
         session_snapshot = self.clone_session_state(state)
         retrieve_started_at = time.perf_counter()
-        full_embeds, full_attention_mask, retrieval_weights = self.build_chat_inputs(
-            session_snapshot,
-            query,
-        )
+        full_embeds, full_attention_mask = self.build_chat_inputs(session_snapshot, query)
         retrieve_elapsed = time.perf_counter() - retrieve_started_at
         generate_started_at = time.perf_counter()
         output_ids = self.backbone.generate_from_embeds(
@@ -419,7 +420,7 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         return {
             "answer": answer,
             "memory_version": session_snapshot.memory_version,
-            "retrieval_weights": retrieval_weights.detach().cpu(),
+            "retrieval_weights": None,
             "session_state": session_snapshot,
             "profile": {
                 "path": "memory",
@@ -482,8 +483,9 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
     ) -> dict[str, torch.Tensor]:
         batch_size, max_history_chunks, _ = history_input_ids.shape
         device = input_ids.device
-        memory_state = self.memory.init_state(batch_size, device)
-        write_gate_logits: list[torch.Tensor] = []
+
+        # Initialize NLM state
+        nlm_state = self.memory.init_state(device)
 
         for chunk_index in range(max_history_chunks):
             active_samples = history_chunk_mask[:, chunk_index]
@@ -492,27 +494,28 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             chunk_input_ids = history_input_ids[:, chunk_index]
             chunk_attention_mask = history_attention_mask[:, chunk_index]
             hidden_states = self.backbone.encode_tokens(chunk_input_ids, chunk_attention_mask)
-            write_repr = self._pool_hidden(hidden_states, chunk_attention_mask)
-            if self.config.use_write_gate_loss:
-                predicted_gate_logits = self.write_decision_head(write_repr).squeeze(-1)
-                write_gate_logits.append(predicted_gate_logits)
-            memory_state, _ = self.memory.update(memory_state, write_repr)
+            # Write hidden_states into NLM
+            nlm_state = self.memory.write(hidden_states, nlm_state)
 
-        question_hidden = self.backbone.encode_tokens(question_input_ids, question_attention_mask)
-        question_repr = self._pool_hidden(question_hidden, question_attention_mask)
-        retrieved, retrieval_weights = self.memory.retrieve(memory_state, question_repr)
+        # Retrieve using learnable query tokens
+        query_tokens = self.memory_query_tokens.unsqueeze(0).expand(batch_size, -1, -1)
+        retrieved = self.memory.retrieve(query_tokens, nlm_state)  # (batch, 64, dim)
 
+        # Build input with memory prefix (scale to match token embedding norm)
         token_embeds = self.backbone.embed_input_ids(input_ids)
-        prefix_embeds = retrieved.unsqueeze(1).to(dtype=token_embeds.dtype)
+        prefix = retrieved.to(dtype=token_embeds.dtype)
+        token_norm = token_embeds.norm(dim=-1, keepdim=True).mean()
+        prefix_norm = prefix.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        prefix = prefix * (token_norm / prefix_norm)
         prefix_attention_mask = torch.ones(
-            (batch_size, 1),
+            (batch_size, prefix.shape[1]),
             device=device,
             dtype=attention_mask.dtype,
         )
-        full_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)
+        full_embeds = torch.cat([prefix, token_embeds], dim=1)
         full_attention_mask = torch.cat([prefix_attention_mask, attention_mask], dim=1)
         prefix_labels = torch.full(
-            (batch_size, 1),
+            (batch_size, prefix.shape[1]),
             fill_value=-100,
             device=device,
             dtype=labels.dtype,
@@ -526,22 +529,13 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         if outputs.loss is None:
             raise RuntimeError("Backbone did not return loss")
 
-        write_gate_loss = torch.tensor(0.0, device=device)
-        if self.config.use_write_gate_loss and write_counts is not None and write_gate_logits:
-            average_gate_logits = torch.stack(write_gate_logits, dim=1).mean(dim=1)
-            write_targets = (write_counts > 0).to(dtype=average_gate_logits.dtype)
-            write_gate_loss = nn.functional.binary_cross_entropy_with_logits(
-                average_gate_logits,
-                write_targets,
-            )
-
-        total_loss = outputs.loss + 0.1 * write_gate_loss
+        total_loss = outputs.loss
         return {
             "loss": total_loss,
             "answer_loss": outputs.loss.detach(),
-            "write_gate_loss": write_gate_loss.detach(),
+            "write_gate_loss": torch.tensor(0.0, device=device),
             "logits": outputs.logits[:, 1:, :],
-            "retrieval_weights": retrieval_weights.detach(),
+            "retrieval_weights": torch.zeros(1, device=device),
         }
 
 

@@ -62,7 +62,6 @@ from titans.stage1_models import (
     Stage1SessionState,
     Stage1SessionStats,
     FrozenBackboneWithTimelineMemory,
-    DenseTimelineMemory,
     build_stage1_model,
 )
 from titans.stage1_runtime import (
@@ -129,7 +128,7 @@ __all__ = [
     "Stage1SessionState",
     "Stage1SessionStats",
     "FrozenBackboneWithTimelineMemory",
-    "DenseTimelineMemory",
+
     "build_stage1_model",
     "Stage1DeploymentRuntime",
     "Stage1SessionStore",

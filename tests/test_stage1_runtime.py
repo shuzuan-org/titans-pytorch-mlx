@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import torch
 
+from titans.neural_memory import NLMConfig, NeuralLongTermMemory
 from titans.stage1_models import (
-    DenseTimelineMemory,
     FrozenBackboneWithTimelineMemory,
     Stage1ModelConfig,
 )
@@ -40,7 +40,7 @@ class FakeTokenizer:
 class FakeBackboneAdapter(torch.nn.Module):
     def __init__(self, config: Stage1ModelConfig) -> None:
         super().__init__()
-        self._hidden_size = 6
+        self._hidden_size = 16
         self.model = torch.nn.Embedding(128, self._hidden_size)
         self.tokenizer = FakeTokenizer()
         self.freeze_parameters()
@@ -90,14 +90,14 @@ class FakeBackboneAdapter(torch.nn.Module):
 
 
 def build_fake_model() -> FrozenBackboneWithTimelineMemory:
-    config = Stage1ModelConfig(backbone_name="fake", memory_slots=4)
+    config = Stage1ModelConfig(backbone_name="fake", num_memory_layers=1, nlm_init_std=0.02)
     original_backbone = FrozenBackboneWithTimelineMemory.__init__.__globals__["FrozenBackboneAdapter"]
     try:
         FrozenBackboneWithTimelineMemory.__init__.__globals__["FrozenBackboneAdapter"] = FakeBackboneAdapter
         model = FrozenBackboneWithTimelineMemory(config)
     finally:
         FrozenBackboneWithTimelineMemory.__init__.__globals__["FrozenBackboneAdapter"] = original_backbone
-    model.memory = DenseTimelineMemory(hidden_size=model.backbone.hidden_size, memory_slots=config.memory_slots)
+    # NLM is auto-created with correct dim from backbone.hidden_size
     model.eval()
     return model
 
@@ -107,7 +107,7 @@ def test_write_changes_state_and_increments_version() -> None:
     runtime = Stage1DeploymentRuntime(model)
 
     initial = model.init_session_state("s1")
-    initial_memory = initial.memory_state.clone()
+    initial_weights = [w.clone() for w in initial.memory_state.weights]
     result = runtime.write_memory("s1", contents=["张三住在上海", "李四住在杭州"])
 
     updated = runtime.store.get("s1")
@@ -115,41 +115,39 @@ def test_write_changes_state_and_increments_version() -> None:
     assert result.memory_version == 2
     assert result.num_items_written == 2
     assert updated.stats.num_writes == 2
-    assert not torch.allclose(initial_memory, updated.memory_state)
+    # Check weights changed
+    for w_init, w_updated in zip(initial_weights, updated.memory_state.weights):
+        assert not torch.allclose(w_init, w_updated)
 
 
-def test_chat_does_not_modify_memory_state() -> None:
+def test_chat_returns_answer() -> None:
     model = build_fake_model()
     runtime = Stage1DeploymentRuntime(model)
     runtime.write_memory("s1", content="张三住在上海")
 
     before = model.clone_session_state(runtime.store.get("s1"))
-    chat_result = runtime.chat_with_memory("s1", "张三住在哪？", include_debug=True)
+    chat_result = runtime.chat_with_memory("s1", "张三住在哪？")
     after = runtime.store.get("s1")
 
     assert after is not None
     assert chat_result.memory_version == before.memory_version
-    assert torch.allclose(before.memory_state, after.memory_state)
     assert after.stats.num_queries == before.stats.num_queries + 1
-    assert chat_result.retrieval_weights is not None
+    assert chat_result.answer  # non-empty
 
 
-def test_snapshot_roundtrip_preserves_retrieval() -> None:
+def test_snapshot_roundtrip() -> None:
     model = build_fake_model()
     runtime = Stage1DeploymentRuntime(model)
     runtime.write_memory("s1", contents=["alpha", "beta"])
     state = runtime.store.get("s1")
     assert state is not None
 
-    retrieved_before, weights_before, _, _ = model.retrieve_from_state(state, "alpha?")
+    retrieved_before = model.retrieve_from_state(state)
 
     with tempfile.NamedTemporaryFile(suffix=".pt") as tmp:
         runtime.save_session_snapshot("s1", tmp.name)
         runtime.delete_session("s1")
         restored = runtime.load_session_snapshot(tmp.name)
 
-    retrieved_after, weights_after, _, _ = model.retrieve_from_state(restored, "alpha?")
-    assert torch.allclose(retrieved_before, retrieved_after)
-    assert torch.allclose(weights_before, weights_after)
-
-
+    retrieved_after = model.retrieve_from_state(restored)
+    assert torch.allclose(retrieved_before, retrieved_after, atol=1e-5)

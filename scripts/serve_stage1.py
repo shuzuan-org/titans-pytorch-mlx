@@ -28,9 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-path", default=None)
     parser.add_argument("--torch-dtype", default="auto")
     parser.add_argument("--attn-implementation")
-    parser.add_argument("--memory-slots", type=int, default=16)
-    parser.add_argument("--memory-hidden-mult", type=float, default=2.0)
-    parser.add_argument("--memory-dropout", type=float, default=0.0)
+    parser.add_argument("--memory-hidden-mult", type=float, default=4.0)
     parser.add_argument("--history-backbone-mode", default="full")
     parser.add_argument("--memory-update-source", default="last_hidden")
     parser.add_argument("--num-retrieved-memory-tokens", type=int, default=16)
@@ -54,9 +52,7 @@ def build_runtime(args: argparse.Namespace) -> Stage1DeploymentRuntime:
         memory_update_source=args.memory_update_source,
         num_retrieved_memory_tokens=args.num_retrieved_memory_tokens,
         loss_mask_scope=args.loss_mask_scope,
-        memory_slots=args.memory_slots,
         memory_hidden_mult=args.memory_hidden_mult,
-        memory_dropout=args.memory_dropout,
         trust_remote_code=args.trust_remote_code,
         prompt_version=args.prompt_version,
     )

@@ -38,6 +38,7 @@ train = [
     "datasets>=2.16.0",
     "wandb>=0.16.0",
     "accelerate>=0.25.0",
+    "peft>=0.13.0",
 ]
 hub = [
     "huggingface_hub>=0.20.0",
@@ -90,7 +91,7 @@ warn_unused_ignores = true
 disallow_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["torch.*", "transformers.*", "datasets.*", "wandb.*", "accelerate.*", "flash_attn.*", "triton.*", "huggingface_hub.*", "bitsandbytes.*", "mlx.*"]
+module = ["torch.*", "transformers.*", "datasets.*", "wandb.*", "accelerate.*", "flash_attn.*", "triton.*", "huggingface_hub.*", "bitsandbytes.*", "mlx.*", "peft.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""将 knowledge.jsonl 中的新数据同步到 train.jsonl（按 question_id 去重）。
+"""将 knowledge.jsonl 中的新数据同步到 train.jsonl（按内容去重）。
 
 knowledge.jsonl 支持两种格式：
 
@@ -14,6 +14,19 @@ import argparse
 from pathlib import Path
 
 DEFAULT_DIR = Path(__file__).resolve().parent.parent / "data" / "generated" / "stage1_timeline_v2"
+
+
+def _record_key(rec: dict) -> str:
+    """提取记录的核心内容作为去重 key。"""
+    return json.dumps(
+        {
+            "history_chunks": rec.get("history_chunks", []),
+            "question_chunk": rec.get("question_chunk", ""),
+            "answer": rec.get("answer", ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 def _next_knowledge_id(existing_ids: set[str]) -> int:
@@ -40,7 +53,7 @@ def _normalize_record(rec: dict, idx: int) -> dict:
         rec["meta"] = meta
         return rec
 
-    # 简洁格式，自动生成
+    # 简洁格式，用递增序号生成 id
     episode_id = f"knowledge_{idx:06d}"
     rec["episode_id"] = episode_id
     rec["question_id"] = f"{episode_id}:q:0:0"
@@ -70,8 +83,9 @@ def main():
         print(f"knowledge.jsonl 不存在: {knowledge_path}")
         return
 
-    # 读取 train 中已有的 question_id
-    existing_ids = set()
+    # 读取 train 中已有的内容和 question_id
+    existing_keys: set[str] = set()
+    existing_ids: set[str] = set()
     if train_path.exists():
         with open(train_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -79,6 +93,7 @@ def main():
                 if not line:
                     continue
                 rec = json.loads(line)
+                existing_keys.add(_record_key(rec))
                 existing_ids.add(rec["question_id"])
 
     # 读取 knowledge 并补齐字段
@@ -91,16 +106,17 @@ def main():
                 continue
             raw_records.append(json.loads(line))
 
-    # 先对简洁格式分配 id，再去重
+    # 按内容去重
     new_records = []
     for rec in raw_records:
+        key = _record_key(rec)
+        if key in existing_keys:
+            continue
         rec = _normalize_record(rec, next_idx)
-        qid = rec["question_id"]
-        if qid not in existing_ids:
-            new_records.append(rec)
-            existing_ids.add(qid)
-            if qid.startswith("knowledge_"):
-                next_idx += 1
+        new_records.append(rec)
+        existing_keys.add(key)
+        if rec["question_id"].startswith("knowledge_"):
+            next_idx += 1
 
     if not new_records:
         print("没有新数据需要同步。")

@@ -79,6 +79,11 @@ class Stage1TrainingConfig:
     wandb_run_name: str | None = None
     prompt_version: str = DEFAULT_STAGE1_PROMPT_VERSION
     use_write_gate_loss: bool = False
+    use_lora: bool = False
+    lora_rank: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target: str = "q_proj,k_proj,v_proj,o_proj"
 
 
 class Stage1Trainer:
@@ -380,6 +385,12 @@ def parse_args() -> Stage1TrainingConfig:
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--prompt-version", default=DEFAULT_STAGE1_PROMPT_VERSION, choices=["v2", "v3", "v4"])
     parser.add_argument("--use-write-gate-loss", action="store_true")
+    parser.add_argument("--use-lora", action="store_true")
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--lora-target", default="q_proj,k_proj,v_proj,o_proj",
+                        help="逗号分隔的 LoRA target modules")
     args = parser.parse_args()
     if args.checkpoint_dir is None:
         args.checkpoint_dir = default_stage1_checkpoint_dir(args.prompt_version)
@@ -441,6 +452,11 @@ def main() -> None:
         trust_remote_code=config.trust_remote_code,
         prompt_version=config.prompt_version,
         use_write_gate_loss=config.use_write_gate_loss,
+        use_lora=config.use_lora,
+        lora_rank=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        lora_target_modules=[m.strip() for m in config.lora_target.split(",")],
     )
     model = build_stage1_model(model_config)
     logger.info("Prompt version: %s", config.prompt_version)

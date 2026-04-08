@@ -38,6 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--prompt-version", default=DEFAULT_STAGE1_PROMPT_VERSION, choices=["v2", "v3", "v4"])
+    parser.add_argument("--use-lora", action="store_true")
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--lora-target", default="q_proj,k_proj,v_proj,o_proj",
+                        help="逗号分隔的 LoRA target modules")
     args = parser.parse_args()
     if args.checkpoint_path is None:
         default_checkpoint_path = default_stage1_checkpoint_path(args.prompt_version)
@@ -59,6 +65,11 @@ def build_runtime(args: argparse.Namespace) -> Stage1DeploymentRuntime:
         memory_dropout=args.memory_dropout,
         trust_remote_code=args.trust_remote_code,
         prompt_version=args.prompt_version,
+        use_lora=args.use_lora,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_target_modules=[m.strip() for m in args.lora_target.split(",")],
     )
     return Stage1DeploymentRuntime.from_model_config(
         config=config,

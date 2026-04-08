@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -93,6 +94,7 @@ class FrozenBackboneAdapter(nn.Module):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
+        self.use_lora = config.use_lora
         if config.use_lora:
             self._apply_lora(config)
         else:
@@ -137,13 +139,21 @@ class FrozenBackboneAdapter(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        with torch.no_grad():
+        if self.use_lora:
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=True,
                 return_dict=True,
             )
+        else:
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
         return outputs.hidden_states[-1]
 
     def forward_with_embeds(
@@ -189,7 +199,8 @@ class FrozenBackboneAdapter(nn.Module):
             config["pad_token_id"] = self.tokenizer.pad_token_id
         if "eos_token_id" not in config:
             config["eos_token_id"] = self.tokenizer.eos_token_id
-        with torch.inference_mode():
+        ctx = self.model.disable_adapter() if self.use_lora else nullcontext()
+        with torch.inference_mode(), ctx:
             return self.model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -463,10 +474,28 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             },
         }
 
-    def load_trainable_state_dict(self, state_dict: dict[str, torch.Tensor], strict: bool = False) -> None:
+    def load_trainable_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
         own_state = self.state_dict()
+        trainable_names = {name for name, p in self.named_parameters() if p.requires_grad}
+
+        # checkpoint 中有但模型中没有的 key → LoRA checkpoint 加载到非 LoRA 模型
+        missing_from_model = [k for k in state_dict if k not in own_state]
+        # 模型中可训练但 checkpoint 中没有的 key → 非 LoRA checkpoint 加载到 LoRA 模型
+        missing_from_ckpt = [k for k in trainable_names if k not in state_dict]
+
+        if missing_from_model:
+            raise RuntimeError(
+                f"Checkpoint contains {len(missing_from_model)} keys not in model "
+                f"(config mismatch?): {missing_from_model[:5]}"
+            )
+        if missing_from_ckpt:
+            raise RuntimeError(
+                f"Model has {len(missing_from_ckpt)} trainable keys not in checkpoint "
+                f"(config mismatch?): {missing_from_ckpt[:5]}"
+            )
+
         filtered = {name: tensor for name, tensor in state_dict.items() if name in own_state}
-        self.load_state_dict(filtered, strict=strict)
+        self.load_state_dict(filtered, strict=False)
 
     def forward(
         self,

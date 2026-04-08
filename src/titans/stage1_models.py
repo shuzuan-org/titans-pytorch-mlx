@@ -119,21 +119,13 @@ class FrozenBackboneAdapter(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        if self.use_lora:
+        with torch.no_grad():
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 output_hidden_states=True,
                 return_dict=True,
             )
-        else:
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
         return outputs.hidden_states[-1]
 
     def forward_with_embeds(

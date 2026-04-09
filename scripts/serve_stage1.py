@@ -29,6 +29,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-dtype", default="auto")
     parser.add_argument("--attn-implementation")
     parser.add_argument("--memory-slots", type=int, default=16)
+    parser.add_argument("--top-k-write", type=int, default=4)
+    parser.add_argument("--top-k-read", type=int, default=16)
+    parser.add_argument("--memory-temperature", type=float, default=0.3)
     parser.add_argument("--memory-hidden-mult", type=float, default=2.0)
     parser.add_argument("--memory-dropout", type=float, default=0.0)
     parser.add_argument("--history-backbone-mode", default="full")
@@ -61,6 +64,9 @@ def build_runtime(args: argparse.Namespace) -> Stage1DeploymentRuntime:
         num_retrieved_memory_tokens=args.num_retrieved_memory_tokens,
         loss_mask_scope=args.loss_mask_scope,
         memory_slots=args.memory_slots,
+        top_k_write=args.top_k_write,
+        top_k_read=args.top_k_read,
+        memory_temperature=args.memory_temperature,
         memory_hidden_mult=args.memory_hidden_mult,
         memory_dropout=args.memory_dropout,
         trust_remote_code=args.trust_remote_code,

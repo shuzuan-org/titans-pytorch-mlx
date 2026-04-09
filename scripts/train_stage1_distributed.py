@@ -52,6 +52,9 @@ class Stage1TrainingConfig:
     num_retrieved_memory_tokens: int = 16
     loss_mask_scope: str = "answer_only"
     memory_slots: int = 16
+    top_k_write: int = 4
+    top_k_read: int = 16
+    memory_temperature: float = 0.3
     memory_hidden_mult: float = 2.0
     memory_dropout: float = 0.0
     max_history_length: int = 128
@@ -358,6 +361,9 @@ def parse_args() -> Stage1TrainingConfig:
     parser.add_argument("--num-retrieved-memory-tokens", type=int, default=16)
     parser.add_argument("--loss-mask-scope", default="answer_only")
     parser.add_argument("--memory-slots", type=int, default=16)
+    parser.add_argument("--top-k-write", type=int, default=4)
+    parser.add_argument("--top-k-read", type=int, default=16)
+    parser.add_argument("--memory-temperature", type=float, default=0.3)
     parser.add_argument("--memory-hidden-mult", type=float, default=2.0)
     parser.add_argument("--memory-dropout", type=float, default=0.0)
     parser.add_argument("--max-history-length", type=int, default=128)
@@ -447,6 +453,9 @@ def main() -> None:
         num_retrieved_memory_tokens=config.num_retrieved_memory_tokens,
         loss_mask_scope=config.loss_mask_scope,
         memory_slots=config.memory_slots,
+        top_k_write=config.top_k_write,
+        top_k_read=config.top_k_read,
+        memory_temperature=config.memory_temperature,
         memory_hidden_mult=config.memory_hidden_mult,
         memory_dropout=config.memory_dropout,
         trust_remote_code=config.trust_remote_code,

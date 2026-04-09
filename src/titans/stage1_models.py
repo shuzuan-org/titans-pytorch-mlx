@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -31,6 +32,9 @@ class Stage1ModelConfig:
     num_retrieved_memory_tokens: int = 16
     loss_mask_scope: str = "answer_only"
     memory_slots: int = 16
+    top_k_write: int = 4
+    top_k_read: int = 16
+    memory_temperature: float = 0.3
     memory_hidden_mult: float = 2.0
     memory_dropout: float = 0.0
     trust_remote_code: bool = False
@@ -181,42 +185,93 @@ class FrozenBackboneAdapter(nn.Module):
 
 
 class DenseTimelineMemory(nn.Module):
-    def __init__(self, hidden_size: int, memory_slots: int) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        memory_slots: int,
+        top_k_write: int = 4,
+        top_k_read: int = 16,
+        temperature: float = 0.3,
+    ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.memory_slots = memory_slots
-        self.initial_memory = nn.Parameter(torch.randn(memory_slots, hidden_size) * 0.02)
+        self.top_k_write = top_k_write
+        self.top_k_read = top_k_read
+        self.temperature = temperature
+
+        # L2 归一化初始化，超球面均匀分布
+        raw = torch.randn(memory_slots, hidden_size)
+        self.initial_memory = nn.Parameter(F.normalize(raw, p=2, dim=-1))
+
+        # Write 投影
         self.write_key = nn.Linear(hidden_size, hidden_size, bias=False)
         self.write_value = nn.Linear(hidden_size, hidden_size, bias=False)
         self.write_gate = nn.Linear(hidden_size, 1)
+
+        # Read 投影
         self.query_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.output_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.output_norm = nn.LayerNorm(hidden_size)
 
     def init_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
         return self.initial_memory.unsqueeze(0).expand(batch_size, -1, -1).to(device=device)
 
     def update(self, state: torch.Tensor, write_repr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # state: (B, S, H), write_repr: (B, H)
         target_dtype = self.write_key.weight.dtype
         state = state.to(dtype=target_dtype)
         write_repr = write_repr.to(dtype=target_dtype)
-        key = self.write_key(write_repr)
-        value = self.write_value(write_repr)
-        scores = torch.matmul(state, key.unsqueeze(-1)).squeeze(-1) / (self.hidden_size**0.5)
-        weights = torch.softmax(scores, dim=-1)
-        gate = torch.sigmoid(self.write_gate(write_repr))
-        update = weights.unsqueeze(-1) * value.unsqueeze(1)
-        next_state = state + gate.unsqueeze(-1) * update
+
+        key = self.write_key(write_repr)                                      # (B, H)
+        # 余弦相似度替代点积
+        state_norm = F.normalize(state, dim=-1)                               # (B, S, H)
+        key_norm = F.normalize(key, dim=-1)                                   # (B, H)
+        scores = torch.matmul(state_norm, key_norm.unsqueeze(-1)).squeeze(-1)  # (B, S)
+        scores = scores / self.temperature
+
+        # Top-K 稀疏：只更新最匹配的 K 个槽
+        topk_scores, topk_idx = scores.topk(self.top_k_write, dim=-1)         # (B, K)
+        topk_weights = torch.softmax(topk_scores, dim=-1)                     # (B, K)
+
+        value = self.write_value(write_repr)                                  # (B, H)
+        gate = torch.sigmoid(self.write_gate(write_repr))                     # (B, 1)
+
+        # 构造稀疏更新，scatter 到对应槽位
+        update_vecs = topk_weights.unsqueeze(-1) * value.unsqueeze(1)         # (B, K, H)
+        update_vecs = gate.unsqueeze(-1) * update_vecs                        # (B, K, H)
+
+        next_state = state.clone()
+        topk_idx_expanded = topk_idx.unsqueeze(-1).expand_as(update_vecs)     # (B, K, H)
+        next_state.scatter_add_(1, topk_idx_expanded, update_vecs)
+
         return next_state, gate.squeeze(-1)
 
     def retrieve(self, state: torch.Tensor, query_repr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # state: (B, S, H), query_repr: (B, H)
         target_dtype = self.query_proj.weight.dtype
         state = state.to(dtype=target_dtype)
         query_repr = query_repr.to(dtype=target_dtype)
-        query = self.query_proj(query_repr)
-        scores = torch.matmul(state, query.unsqueeze(-1)).squeeze(-1) / (self.hidden_size**0.5)
-        weights = torch.softmax(scores, dim=-1)
-        retrieved = torch.sum(weights.unsqueeze(-1) * state, dim=1)
-        return self.output_proj(retrieved), weights
+
+        query = self.query_proj(query_repr)                                    # (B, H)
+        state_norm = F.normalize(state, dim=-1)                                # (B, S, H)
+        query_norm = F.normalize(query, dim=-1)                                # (B, H)
+        scores = torch.matmul(state_norm, query_norm.unsqueeze(-1)).squeeze(-1)  # (B, S)
+        scores = scores / self.temperature
+
+        # Top-K 检索
+        topk_scores, topk_idx = scores.topk(self.top_k_read, dim=-1)          # (B, K)
+        topk_weights = torch.softmax(topk_scores, dim=-1)                     # (B, K)
+
+        # 取出 top-K 槽位
+        topk_idx_expanded = topk_idx.unsqueeze(-1).expand(-1, -1, self.hidden_size)  # (B, K, H)
+        retrieved_slots = torch.gather(state, 1, topk_idx_expanded)            # (B, K, H)
+
+        # 按权重加权，投影 + LayerNorm 对齐 backbone embedding 空间
+        weighted_slots = topk_weights.unsqueeze(-1) * retrieved_slots          # (B, K, H)
+        prefix_embeds = self.output_norm(self.output_proj(weighted_slots))     # (B, K, H)
+
+        return prefix_embeds, topk_weights
 
 
 
@@ -230,6 +285,9 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         self.memory = DenseTimelineMemory(
             hidden_size=self.backbone.hidden_size,
             memory_slots=config.memory_slots,
+            top_k_write=config.top_k_write,
+            top_k_read=config.top_k_read,
+            temperature=config.memory_temperature,
         )
         self.write_decision_head = nn.Linear(self.backbone.hidden_size, 1)
         if not self.config.use_write_gate_loss:
@@ -397,9 +455,9 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             query,
         )
         token_embeds = self.backbone.embed_input_ids(input_ids)
-        prefix_embeds = retrieved.unsqueeze(1).to(dtype=token_embeds.dtype)
+        prefix_embeds = retrieved.to(dtype=token_embeds.dtype)                 # (1, K, H)
         prefix_attention_mask = torch.ones(
-            (1, 1),
+            (1, self.config.top_k_read),
             device=attention_mask.device,
             dtype=attention_mask.dtype,
         )
@@ -541,16 +599,16 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
         retrieved, retrieval_weights = self.memory.retrieve(memory_state, question_repr)
 
         token_embeds = self.backbone.embed_input_ids(input_ids)
-        prefix_embeds = retrieved.unsqueeze(1).to(dtype=token_embeds.dtype)
+        prefix_embeds = retrieved.to(dtype=token_embeds.dtype)                 # (B, K, H)
         prefix_attention_mask = torch.ones(
-            (batch_size, 1),
+            (batch_size, self.config.top_k_read),
             device=device,
             dtype=attention_mask.dtype,
         )
         full_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)
         full_attention_mask = torch.cat([prefix_attention_mask, attention_mask], dim=1)
         prefix_labels = torch.full(
-            (batch_size, 1),
+            (batch_size, self.config.top_k_read),
             fill_value=-100,
             device=device,
             dtype=labels.dtype,
@@ -574,6 +632,18 @@ class FrozenBackboneWithTimelineMemory(nn.Module):
             )
 
         total_loss = outputs.loss + 0.1 * write_gate_loss
+
+        # DDP Stability Hack: 
+        # When `max_history_chunks == 0` (or active_samples is False for all chunks), `self.memory.update` is skipped.
+        # This leaves parameters like `write_key` entirely disconnected from the computation graph.
+        # DDP + Gradient Accumulation will violently crash if param usage changes across steps.
+        # We force all trainable parameters into the graph with a perfectly harmless 0.0 gradient.
+        if self.training:
+            dummy_loss = 0.0
+            for param in self.get_trainable_parameters():
+                dummy_loss = dummy_loss + param.sum() * 0.0
+            total_loss = total_loss + dummy_loss
+
         return {
             "loss": total_loss,
             "answer_loss": outputs.loss.detach(),

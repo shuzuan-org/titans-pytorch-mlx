@@ -129,8 +129,10 @@ def _mask_answer_only_labels(
     pad_token_id: int,
 ) -> torch.Tensor:
     labels = input_ids.clone()
+    # 只屏蔽 attention_mask=0 的 padding 位置
+    # 注意：不能用 input_ids == pad_token_id，因为 Qwen2.5 的 pad_token 和 eos_token
+    # 是同一个 id（都是 <|endoftext|>），会把 answer 末尾的 EOS 也 mask 掉
     labels[attention_mask == 0] = -100
-    labels[input_ids == pad_token_id] = -100
     for row_index, prompt_len in enumerate(prompt_lengths):
         labels[row_index, :prompt_len] = -100
     return labels

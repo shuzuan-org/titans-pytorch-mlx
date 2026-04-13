@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from titans.stage1_data import Stage1Dataset, stage1_collate_fn
@@ -424,9 +424,17 @@ def build_dataloaders(
         pin_memory=True,
         collate_fn=collate,
     )
+    eval_dataset_full = Stage1Dataset(config.data_dir, split="eval", prompt_version=config.prompt_version)
+    if len(eval_dataset_full) > 30:
+        rng = torch.Generator().manual_seed(config.seed)
+        indices = torch.randperm(len(eval_dataset_full), generator=rng)[:30].tolist()
+        eval_dataset: Any = Subset(eval_dataset_full, indices)
+        logger.info("Eval set subsampled: %d / %d", len(eval_dataset), len(eval_dataset_full))
+    else:
+        eval_dataset = eval_dataset_full
     eval_dataloaders = {
         "timeline": DataLoader(
-            Stage1Dataset(config.data_dir, split="eval", prompt_version=config.prompt_version),
+            eval_dataset,
             batch_size=config.eval_batch_size,
             shuffle=False,
             num_workers=config.num_workers,
